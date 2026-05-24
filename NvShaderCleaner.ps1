@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     NvShaderCleaner — корректная очистка кэша шейдеров NVIDIA на Windows 10/11.
 

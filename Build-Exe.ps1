@@ -1,17 +1,14 @@
-<#
+﻿<#
 .SYNOPSIS
-    Сборка NvShaderCleaner.ps1 в NvShaderCleaner.exe через ps2exe.
+    Build NvShaderCleaner.ps1 into NvShaderCleaner.exe via ps2exe.
 
 .DESCRIPTION
-    Запускать на Windows-машине в обычном PowerShell.
-    Скрипт сам установит модуль ps2exe (из PowerShell Gallery) при необходимости,
-    а затем соберёт .exe с манифестом requireAdministrator и (опционально) иконкой.
+    Run on a Windows machine in PowerShell.
+    Installs ps2exe from PowerShell Gallery if needed, then compiles the .exe
+    with requireAdministrator manifest and an optional icon.
 
 .NOTES
-    Требования:
-      • Windows
-      • PowerShell 5.1+ (рекомендуется 7+)
-      • Интернет для первой установки ps2exe
+    Requirements: Windows, PowerShell 5.1+, Internet (once, to install ps2exe).
 #>
 
 [CmdletBinding()]
@@ -28,71 +25,67 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-# Снимаем ограничение ExecutionPolicy только для текущего процесса, чтобы
-# пользователю не нужно было выполнять Set-ExecutionPolicy отдельной командой.
 try {
     Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force -ErrorAction SilentlyContinue
 } catch { }
 
 if (-not (Test-Path $Source)) {
-    throw "Не найден исходник: $Source"
+    throw "Source not found: $Source"
 }
 
-# 1. Установить ps2exe, если ещё не установлен
+# 1. Install ps2exe if missing
 if (-not (Get-Module -ListAvailable -Name ps2exe)) {
-    Write-Host '[BUILD] Устанавливаю модуль ps2exe из PSGallery...' -ForegroundColor Cyan
+    Write-Host '[BUILD] Installing ps2exe from PSGallery ...' -ForegroundColor Cyan
     try {
         if ((Get-PSRepository -Name PSGallery).InstallationPolicy -ne 'Trusted') {
             Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction SilentlyContinue
         }
         Install-Module -Name ps2exe -Scope CurrentUser -Force -AllowClobber
     } catch {
-        throw "Не удалось установить ps2exe: $($_.Exception.Message)"
+        throw "Failed to install ps2exe: $($_.Exception.Message)"
     }
 }
 
 Import-Module ps2exe -Force
 
-# 2. Сборка
+# 2. Build
 $invokeArgs = @{
-    InputFile      = $Source
-    OutputFile     = $Output
-    NoConsole      = $true
-    RequireAdmin   = $true
-    Title          = $Title
-    Description    = $Description
-    Company        = $Company
-    Version        = $Version
-    Product        = $Title
-    Copyright      = "(c) $(Get-Date -Format yyyy) $Company"
+    InputFile    = $Source
+    OutputFile   = $Output
+    NoConsole    = $true
+    RequireAdmin = $true
+    Title        = $Title
+    Description  = $Description
+    Company      = $Company
+    Version      = $Version
+    Product      = $Title
+    Copyright    = "(c) $(Get-Date -Format yyyy) $Company"
 }
 
 if (Test-Path $IconFile) {
     $invokeArgs['IconFile'] = $IconFile
 }
 
-Write-Host "[BUILD] Сборка $Output ..." -ForegroundColor Cyan
+Write-Host "[BUILD] Building $Output ..." -ForegroundColor Cyan
 Invoke-PS2EXE @invokeArgs
 
 if (-not (Test-Path $Output)) {
-    throw 'Сборка не удалась: выходной файл не создан.'
+    throw 'Build failed: output file was not created.'
 }
 
-# 3. Опционально — встроить наш собственный манифест (если ps2exe не сделал
-#    requireAdministrator достаточно жёстко). Используем mt.exe, если доступен.
+# 3. Optionally embed our own manifest via mt.exe (if available)
 if (Test-Path $Manifest) {
     $mt = Get-Command mt.exe -ErrorAction SilentlyContinue
     if ($mt) {
-        Write-Host '[BUILD] Встраиваю manifest через mt.exe ...' -ForegroundColor Cyan
+        Write-Host '[BUILD] Embedding manifest via mt.exe ...' -ForegroundColor Cyan
         & $mt.Source -nologo -manifest $Manifest "-outputresource:$Output;#1"
     } else {
-        Write-Host '[BUILD] mt.exe не найден в PATH — пропускаю встраивание manifest. ' `
-                   '(RequireAdmin от ps2exe уже включён, этого обычно достаточно.)' -ForegroundColor Yellow
+        Write-Host '[BUILD] mt.exe not found, skipping manifest embed (ps2exe RequireAdmin is sufficient).' -ForegroundColor Yellow
     }
 }
 
 Write-Host ''
-Write-Host "[BUILD] Готово: $Output" -ForegroundColor Green
+Write-Host "[BUILD] Done: $Output" -ForegroundColor Green
 Write-Host ''
-Write-Host 'Положите рядом папку tools\ (она создастся автоматически при первом запуске,' -ForegroundColor Gray
-Write-Host 'либо вы можете заранее распаковать туда nvidiaProfileInspector.exe).' -ForegroundColor Gray
+Write-Host 'The tools\ folder will be created automatically on first run' -ForegroundColor Gray
+Write-Host '(or you can unpack nvidiaProfileInspector.exe there in advance).' -ForegroundColor Gray
