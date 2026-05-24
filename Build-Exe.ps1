@@ -13,14 +13,14 @@
 
 [CmdletBinding()]
 param(
-    [string]$Source     = (Join-Path $PSScriptRoot 'NvShaderCleaner.ps1'),
-    [string]$Output     = (Join-Path $PSScriptRoot 'NvShaderCleaner.exe'),
-    [string]$Manifest   = (Join-Path $PSScriptRoot 'app.manifest'),
-    [string]$IconFile   = (Join-Path $PSScriptRoot 'icon.ico'),
-    [string]$Title      = 'NvShaderCleaner',
-    [string]$Description= 'NVIDIA Shader Cache Cleaner',
-    [string]$Company    = 'NvShaderCleaner',
-    [string]$Version    = '1.0.0.0'
+    [string]$Source      = '',
+    [string]$Output      = '',
+    [string]$Manifest    = '',
+    [string]$IconFile    = '',
+    [string]$Title       = 'NvShaderCleaner',
+    [string]$Description = 'NVIDIA Shader Cache Cleaner',
+    [string]$Company     = 'NvShaderCleaner',
+    [string]$Version     = '1.0.0.0'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -28,6 +28,16 @@ $ErrorActionPreference = 'Stop'
 try {
     Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force -ErrorAction SilentlyContinue
 } catch { }
+
+# $PSScriptRoot can be empty in param() defaults when invoked via
+# "powershell -File". Compute the script directory here in the body instead.
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
+if (-not $ScriptDir) { $ScriptDir = $PWD.Path }
+
+if (-not $Source)   { $Source   = Join-Path $ScriptDir 'NvShaderCleaner.ps1' }
+if (-not $Output)   { $Output   = Join-Path $ScriptDir 'NvShaderCleaner.exe' }
+if (-not $Manifest) { $Manifest = Join-Path $ScriptDir 'app.manifest' }
+if (-not $IconFile) { $IconFile = Join-Path $ScriptDir 'icon.ico' }
 
 if (-not (Test-Path $Source)) {
     throw "Source not found: $Source"
