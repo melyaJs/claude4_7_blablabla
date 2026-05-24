@@ -28,6 +28,12 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# Снимаем ограничение ExecutionPolicy только для текущего процесса, чтобы
+# пользователю не нужно было выполнять Set-ExecutionPolicy отдельной командой.
+try {
+    Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force -ErrorAction SilentlyContinue
+} catch { }
+
 if (-not (Test-Path $Source)) {
     throw "Не найден исходник: $Source"
 }
