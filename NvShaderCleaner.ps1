@@ -183,8 +183,8 @@ function Initialize-UIAssemblies {
 }
 
 function New-Brush { param([string]$Hex) [System.Windows.Media.BrushConverter]::new().ConvertFrom($Hex) }
-function New-Thickness { param([int]$T=0,[int]$R=0,[int]$B=0,[int]$L=0)
-    if ($PSBoundParameters.Count -eq 1) { return [System.Windows.Thickness]::new($T) }
+function New-Thickness { param([double]$T=0,[double]$R=-1,[double]$B=0,[double]$L=0)
+    if ($R -eq -1) { return [System.Windows.Thickness]::new($T) }
     return [System.Windows.Thickness]::new($L,$T,$R,$B)
 }
 
@@ -198,6 +198,7 @@ function Build-MainWindow {
     $w.WindowStyle = 'None'
     $w.AllowsTransparency = $true
     $w.Background = New-Brush $Script:Color_Bg
+    $w.ShowInTaskbar = $true
     $w.FontFamily = New-Object System.Windows.Media.FontFamily 'Segoe UI Variable Display, Segoe UI, Calibri'
 
     $outer = New-Object System.Windows.Controls.Border
@@ -233,11 +234,25 @@ function Build-MainWindow {
     $subTb = New-Object System.Windows.Controls.TextBlock
     $subTb.Text = "NVIDIA shader cache cleaner  ·  by $($Script:AppAuthor)"
     $subTb.FontSize = 12; $subTb.Foreground = New-Brush $Script:Color_TextDim
-    $subTb.Margin = New-Thickness -T 2
+    $subTb.Margin = New-Thickness -T 2 -R 0
     $titleStack.Children.Add($subTb) | Out-Null
 
     [System.Windows.Controls.Grid]::SetColumn($titleStack, 0)
     $headerGrid.Children.Add($titleStack) | Out-Null
+
+    $winBtnStack = New-Object System.Windows.Controls.StackPanel
+    $winBtnStack.Orientation = 'Horizontal'
+    $winBtnStack.VerticalAlignment = 'Top'; $winBtnStack.HorizontalAlignment = 'Right'
+
+    $minBtn = New-Object System.Windows.Controls.Button
+    $minBtn.Content = [char]0x2014; $minBtn.Width = 34; $minBtn.Height = 28
+    $minBtn.FontSize = 14
+    $minBtn.Background = New-Brush $Script:Color_SurfaceAlt
+    $minBtn.Foreground = New-Brush $Script:Color_TextDim
+    $minBtn.BorderBrush = New-Brush $Script:Color_Border
+    $minBtn.Cursor = 'Hand'; $minBtn.Margin = New-Thickness -T 0 -R 4 -B 0 -L 0
+    $minBtn.Add_Click({ $Script:UI.Window.WindowState = 'Minimized' })
+    $winBtnStack.Children.Add($minBtn) | Out-Null
 
     $closeBtn = New-Object System.Windows.Controls.Button
     $closeBtn.Content = [char]0x2715; $closeBtn.Width = 34; $closeBtn.Height = 28
@@ -246,15 +261,17 @@ function Build-MainWindow {
     $closeBtn.Foreground = New-Brush $Script:Color_TextDim
     $closeBtn.BorderBrush = New-Brush $Script:Color_Border
     $closeBtn.Cursor = 'Hand'
-    $closeBtn.VerticalAlignment = 'Top'; $closeBtn.HorizontalAlignment = 'Right'
-    $closeBtn.Add_Click({ $w.Close() })
-    [System.Windows.Controls.Grid]::SetColumn($closeBtn, 1)
-    $headerGrid.Children.Add($closeBtn) | Out-Null
+    $closeBtn.Add_Click({ $Script:UI.Window.Close() })
+    $winBtnStack.Children.Add($closeBtn) | Out-Null
+
+    [System.Windows.Controls.Grid]::SetColumn($winBtnStack, 1)
+    $headerGrid.Children.Add($winBtnStack) | Out-Null
 
     [System.Windows.Controls.Grid]::SetRow($headerGrid, 0)
     $root.Children.Add($headerGrid) | Out-Null
 
-    $w.Add_MouseLeftButtonDown({ try { $w.DragMove() } catch {} })
+    # DragMove is registered in Main after $Script:UI is assigned,
+    # because ps2exe may not capture local $w in event closures.
 
     # ---------- STEPS ROW ----------
     $stepsBorder = New-Object System.Windows.Controls.Border
@@ -287,7 +304,7 @@ function Build-MainWindow {
         $sub = New-Object System.Windows.Controls.TextBlock
         $sub.Text = [char]0x23F3 + ' ожидание'; $sub.FontSize = 10
         $sub.Foreground = New-Brush $Script:Color_TextMuted
-        $sub.Margin = New-Thickness -T 2
+        $sub.Margin = New-Thickness -T 2 -R 0
         $sp.Children.Add($sub) | Out-Null
         [System.Windows.Controls.Grid]::SetColumn($sp, $i)
         $stepsGrid.Children.Add($sp) | Out-Null
@@ -430,10 +447,14 @@ function Update-UI {
     <#
         Pump the WPF dispatcher so the window redraws and processes input.
         Call this between heavy operations to keep the UI responsive.
+        IMPORTANT: BeginInvoke returns DispatcherOperation — must suppress
+        with $null or it leaks into the caller's output stream and corrupts
+        return values (e.g. Ensure-NpiInstalled returning an array instead
+        of a string).
     #>
     try {
         $frame = [System.Windows.Threading.DispatcherFrame]::new()
-        [System.Windows.Threading.Dispatcher]::CurrentDispatcher.BeginInvoke(
+        $null = [System.Windows.Threading.Dispatcher]::CurrentDispatcher.BeginInvoke(
             [System.Windows.Threading.DispatcherPriority]::Background,
             [System.Action]{ $frame.Continue = $false }
         )
@@ -472,7 +493,7 @@ function Add-UILog {
         $tb = New-Object System.Windows.Controls.TextBlock
         $tb.FontFamily = New-Object System.Windows.Media.FontFamily 'Cascadia Mono, Consolas, Segoe UI Mono'
         $tb.FontSize = 11; $tb.TextWrapping = 'Wrap'
-        $tb.Margin = New-Thickness -T 1
+        $tb.Margin = New-Thickness -T 1 -R 0
         $tb.Foreground = New-Brush $color
         $tb.Text = "$Timestamp  $tag$Message"
         [void]$Script:UI.LogPanel.Children.Add($tb)
@@ -1116,6 +1137,13 @@ function Main {
     }
 
     $Script:UI = Build-MainWindow
+
+    # Enable window dragging from any non-control area.
+    # Must be registered here (not in Build-MainWindow) because ps2exe
+    # cannot capture local $w in event closures; $Script:UI is reliable.
+    $Script:UI.Window.Add_MouseLeftButtonDown({
+        try { $Script:UI.Window.DragMove() } catch { }
+    })
 
     # Button handlers break out of nested PushFrame loops
     $Script:UI.YesBtn.Add_Click({
