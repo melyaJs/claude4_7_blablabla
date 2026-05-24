@@ -182,7 +182,7 @@ function Initialize-UIAssemblies {
     Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
 }
 
-function New-Brush { param([string]$Hex) [System.Windows.Media.BrushConverter]::new().ConvertFrom($Hex) }
+function New-Brush { param([string]$Hex) if (-not $Hex) { return $null }; [System.Windows.Media.BrushConverter]::new().ConvertFrom($Hex) }
 function New-Thickness { param([double]$T=0,[double]$R=-1,[double]$B=0,[double]$L=0)
     if ($R -eq -1) { return [System.Windows.Thickness]::new($T) }
     return [System.Windows.Thickness]::new($L,$T,$R,$B)
@@ -251,7 +251,7 @@ function Build-MainWindow {
     $minBtn.Foreground = New-Brush $Script:Color_TextDim
     $minBtn.BorderBrush = New-Brush $Script:Color_Border
     $minBtn.Cursor = 'Hand'; $minBtn.Margin = New-Thickness -T 0 -R 4 -B 0 -L 0
-    $minBtn.Add_Click({ $Script:UI.Window.WindowState = 'Minimized' })
+    $minBtn.Add_Click({ try { $Script:UI.Window.WindowState = 'Minimized' } catch { } })
     $winBtnStack.Children.Add($minBtn) | Out-Null
 
     $closeBtn = New-Object System.Windows.Controls.Button
@@ -261,7 +261,7 @@ function Build-MainWindow {
     $closeBtn.Foreground = New-Brush $Script:Color_TextDim
     $closeBtn.BorderBrush = New-Brush $Script:Color_Border
     $closeBtn.Cursor = 'Hand'
-    $closeBtn.Add_Click({ $Script:UI.Window.Close() })
+    $closeBtn.Add_Click({ try { $Script:UI.Window.Close() } catch { } })
     $winBtnStack.Children.Add($closeBtn) | Out-Null
 
     [System.Windows.Controls.Grid]::SetColumn($winBtnStack, 1)
@@ -503,12 +503,14 @@ function Add-UILog {
 
 function Set-UIStatus {
     param([Parameter(Mandatory)][string]$Text)
+    if (-not $Script:UI) { return }
     try { $Script:UI.StatusText.Text = $Text } catch { }
     Update-UI
 }
 
 function Set-UIProgress {
     param([Parameter(Mandatory)][double]$Percent)
+    if (-not $Script:UI) { return }
     if ($Percent -lt 0)   { $Percent = 0 }
     if ($Percent -gt 100) { $Percent = 100 }
     try {
@@ -525,6 +527,7 @@ function Set-UIStep {
         [Parameter(Mandatory)][ValidateSet('pending','active','done','error')] [string]$Status,
         [string]$Subtitle = $null
     )
+    if (-not $Script:UI) { return }
     try {
         $title = $Script:UI.StepTexts[$Index][0]
         $sub   = $Script:UI.StepTexts[$Index][1]
@@ -605,6 +608,7 @@ function Show-RebootCountdownInWindow {
     if (-not $Script:UI) { return $true }
 
     $script:_secondsLeft = $Seconds
+    $script:_rebootReason = $Reason
     $Script:Prompt.Answer = $null
 
     try {
@@ -620,28 +624,28 @@ function Show-RebootCountdownInWindow {
     $frame = [System.Windows.Threading.DispatcherFrame]::new()
     $Script:Prompt.Frame = $frame
 
-    $timer = New-Object System.Windows.Threading.DispatcherTimer
-    $timer.Interval = [TimeSpan]::FromSeconds(1)
-    $timer.Add_Tick({
-        $script:_secondsLeft--
-        if ($script:_secondsLeft -le 0) {
-            $timer.Stop()
-            if ($Script:Prompt.Frame) {
-                $Script:Prompt.Answer = $true
-                $Script:Prompt.Frame.Continue = $false
+    $Script:_rebootTimer = New-Object System.Windows.Threading.DispatcherTimer
+    $Script:_rebootTimer.Interval = [TimeSpan]::FromSeconds(1)
+    $Script:_rebootTimer.Add_Tick({
+        try {
+            $script:_secondsLeft--
+            if ($script:_secondsLeft -le 0) {
+                $Script:_rebootTimer.Stop()
+                if ($Script:Prompt.Frame) {
+                    $Script:Prompt.Answer = $true
+                    $Script:Prompt.Frame.Continue = $false
+                }
+            } else {
+                $Script:UI.ActionText.Text = "$([char]0x26A0)  $($script:_rebootReason)`n$([char]0x23F3) Перезагрузка через $($script:_secondsLeft) сек..."
             }
-        } else {
-            try {
-                $Script:UI.ActionText.Text = "$([char]0x26A0)  $Reason`n$([char]0x23F3) Перезагрузка через $($script:_secondsLeft) сек..."
-            } catch { }
-        }
+        } catch { }
     })
-    $timer.Start()
+    $Script:_rebootTimer.Start()
 
     [System.Windows.Threading.Dispatcher]::PushFrame($frame)
     $Script:Prompt.Frame = $null
 
-    try { $timer.Stop() } catch { }
+    try { $Script:_rebootTimer.Stop() } catch { }
     try { $Script:UI.ActionBorder.Visibility = 'Collapsed' } catch { }
     return $Script:Prompt.Answer
 }
@@ -1147,44 +1151,50 @@ function Main {
 
     # Button handlers break out of nested PushFrame loops
     $Script:UI.YesBtn.Add_Click({
-        $Script:Prompt.Answer = $true
-        if ($Script:Prompt.Frame) { $Script:Prompt.Frame.Continue = $false }
+        try {
+            $Script:Prompt.Answer = $true
+            if ($Script:Prompt.Frame) { $Script:Prompt.Frame.Continue = $false }
+        } catch { }
     })
     $Script:UI.NoBtn.Add_Click({
-        $Script:Prompt.Answer = $false
-        if ($Script:Prompt.Frame) { $Script:Prompt.Frame.Continue = $false }
+        try {
+            $Script:Prompt.Answer = $false
+            if ($Script:Prompt.Frame) { $Script:Prompt.Frame.Continue = $false }
+        } catch { }
     })
 
     # After window renders, start workflow via a one-shot DispatcherTimer.
     # This defers execution so ShowDialog's message loop is running first.
     $Script:UI.Window.Add_ContentRendered({
-        Set-UIStatus 'Инициализация...'
-        $stateNow = Get-State
-        switch ($stateNow.Step) {
-            'INIT'           {
-                Set-UIStep -Index 0 -Status pending
-                Set-UIStep -Index 1 -Status pending
-                Set-UIStep -Index 2 -Status pending
+        try {
+            Set-UIStatus 'Инициализация...'
+            $stateNow = Get-State
+            switch ($stateNow.Step) {
+                'INIT'           {
+                    Set-UIStep -Index 0 -Status pending
+                    Set-UIStep -Index 1 -Status pending
+                    Set-UIStep -Index 2 -Status pending
+                }
+                'AFTER_REBOOT_1' {
+                    Set-UIStep -Index 0 -Status done
+                    Set-UIStep -Index 1 -Status pending
+                    Set-UIStep -Index 2 -Status pending
+                    Set-UIProgress 60
+                }
+                'AFTER_REBOOT_2' {
+                    Set-UIStep -Index 0 -Status done
+                    Set-UIStep -Index 1 -Status done
+                    Set-UIStep -Index 2 -Status pending
+                    Set-UIProgress 95
+                }
             }
-            'AFTER_REBOOT_1' {
-                Set-UIStep -Index 0 -Status done
-                Set-UIStep -Index 1 -Status pending
-                Set-UIStep -Index 2 -Status pending
-                Set-UIProgress 60
-            }
-            'AFTER_REBOOT_2' {
-                Set-UIStep -Index 0 -Status done
-                Set-UIStep -Index 1 -Status done
-                Set-UIStep -Index 2 -Status pending
-                Set-UIProgress 95
-            }
-        }
-        Update-UI
+            Update-UI
+        } catch { }
 
-        $kickoff = New-Object System.Windows.Threading.DispatcherTimer
-        $kickoff.Interval = [TimeSpan]::FromMilliseconds(200)
-        $kickoff.Add_Tick({
-            $kickoff.Stop()
+        $Script:_kickoff = New-Object System.Windows.Threading.DispatcherTimer
+        $Script:_kickoff.Interval = [TimeSpan]::FromMilliseconds(200)
+        $Script:_kickoff.Add_Tick({
+            try { $Script:_kickoff.Stop() } catch { }
             try {
                 $state = Get-State
                 Write-Log "Current step: $($state.Step)" 'INFO'
@@ -1202,13 +1212,15 @@ function Main {
                 try { $Script:UI.Window.Close() } catch { }
             }
         })
-        $kickoff.Start()
+        $Script:_kickoff.Start()
     })
 
     # If window is closed externally (X button), break any active prompt
     $Script:UI.Window.Add_Closed({
-        $Script:Prompt.Answer = $false
-        if ($Script:Prompt.Frame) { $Script:Prompt.Frame.Continue = $false }
+        try {
+            $Script:Prompt.Answer = $false
+            if ($Script:Prompt.Frame) { $Script:Prompt.Frame.Continue = $false }
+        } catch { }
     })
 
     [void]$Script:UI.Window.ShowDialog()
