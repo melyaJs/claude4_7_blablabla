@@ -1,6 +1,14 @@
-﻿<#
+<#
 .SYNOPSIS
-    NvShaderCleaner - clean NVIDIA shader cache on Windows 10/11.
+    NvShaderCleaner by melya - clean NVIDIA shader cache on Windows 10/11.
+
+.DESCRIPTION
+    Single-window WPF application that walks the user through a 3-step
+    NVIDIA shader cache cleanup (set cache size = Disabled, reboot, clean
+    folders, set cache size = Unlimited, reboot, done). The .exe is fully
+    portable: it stores state.json / log.txt / tools / in
+    %LOCALAPPDATA%\NvShaderCleaner, so the single .exe can be copied
+    anywhere and just work.
 #>
 
 [CmdletBinding()]
@@ -13,9 +21,13 @@ param(
 # ============================================================================
 
 $Script:AppName       = 'NvShaderCleaner'
+$Script:AppAuthor     = 'melya'
+$Script:AppVersion    = '1.1.0'
+
 $Script:AppDataDir    = Join-Path $env:LOCALAPPDATA $Script:AppName
 $Script:StateFile     = Join-Path $Script:AppDataDir 'state.json'
 $Script:LogFile       = Join-Path $Script:AppDataDir 'log.txt'
+$Script:ToolsDir      = Join-Path $Script:AppDataDir 'tools'
 $Script:TaskName      = 'NvShaderCleaner_Resume'
 
 $Script:NpiVersion    = '2.4.0.4'
@@ -29,6 +41,20 @@ $Script:ShaderCacheSizeSettingId    = '11306135'
 $Script:ShaderCacheSizeSettingName  = 'Shader disk cache maximum size'
 $Script:ShaderCacheSize_Disabled    = '0'
 $Script:ShaderCacheSize_Unlimited   = '4294967295'
+
+# Nvidia-inspired green palette
+$Script:Color_Bg          = '#0B0F0B'
+$Script:Color_Surface     = '#121A12'
+$Script:Color_SurfaceAlt  = '#172217'
+$Script:Color_Border      = '#1F3A1F'
+$Script:Color_NvGreen     = '#76B900'
+$Script:Color_NvGreenSoft = '#9CDB2A'
+$Script:Color_TextMain    = '#E6F2D8'
+$Script:Color_TextDim     = '#9DBA7D'
+$Script:Color_TextMuted   = '#6E8C5A'
+$Script:Color_Warn        = '#F9E2AF'
+$Script:Color_Error       = '#F38BA8'
+$Script:Color_Ok          = '#A6E3A1'
 
 $Script:NvidiaProcessNames = @(
     'nvcontainer',
@@ -51,6 +77,14 @@ $Script:NvidiaProcessNames = @(
     'nvxdbat'
 )
 
+# Shared UI / workflow state
+$Script:UI       = $null
+$Script:Worker   = $null
+$Script:Prompt   = @{
+    Event  = $null
+    Answer = $null
+}
+
 # ============================================================================
 #                               HELPERS
 # ============================================================================
@@ -66,24 +100,12 @@ function Write-Log {
         [Parameter(Mandatory)] [string] $Message,
         [ValidateSet('INFO','WARN','ERROR','OK')] [string] $Level = 'INFO'
     )
-    $ts = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+    $ts   = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
     $line = "[$ts] [$Level] $Message"
     try {
         Add-Content -Path $Script:LogFile -Value $line -Encoding UTF8
     } catch { }
-    try { Write-Host $line } catch { }
-}
-
-function Get-AppDir {
-    try {
-        $exePath = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
-        if ($exePath -and ($exePath -notmatch 'powershell|pwsh|conhost')) {
-            return Split-Path -Parent $exePath
-        }
-    } catch { }
-    if ($PSScriptRoot) { return $PSScriptRoot }
-    if ($MyInvocation.MyCommand.Path) { return Split-Path -Parent $MyInvocation.MyCommand.Path }
-    return (Get-Location).Path
+    Add-UILog -Message $Message -Level $Level -Timestamp $ts
 }
 
 function Get-SelfExePath {
@@ -103,13 +125,15 @@ function Test-Administrator {
 function Invoke-SelfElevate {
     $exe = Get-SelfExePath
     if (-not $exe) {
-        Show-ErrorBox 'Не удалось определить путь к .exe для повышения прав.'
+        [System.Windows.MessageBox]::Show('Не удалось определить путь к .exe для повышения прав.',
+            $Script:AppName, 'OK', 'Error') | Out-Null
         exit 1
     }
     try {
         Start-Process -FilePath $exe -Verb RunAs -ArgumentList '-Elevated' | Out-Null
     } catch {
-        Show-ErrorBox "Запуск с правами администратора отменён: $($_.Exception.Message)"
+        [System.Windows.MessageBox]::Show("Запуск с правами администратора отменён: $($_.Exception.Message)",
+            $Script:AppName, 'OK', 'Error') | Out-Null
         exit 1
     }
     exit 0
@@ -119,25 +143,22 @@ function Invoke-SelfElevate {
 #                              STATE MACHINE
 # ============================================================================
 
-function Get-State {
-    if (-not (Test-Path $Script:StateFile)) {
-        return [pscustomobject]@{
-            Step      = 'INIT'
-            StartedAt = (Get-Date).ToString('o')
-            NpiPath   = $null
-            SteamPath = $null
-        }
+function New-DefaultState {
+    return [pscustomobject]@{
+        Step      = 'INIT'
+        StartedAt = (Get-Date).ToString('o')
+        NpiPath   = $null
+        SteamPath = $null
     }
+}
+
+function Get-State {
+    if (-not (Test-Path $Script:StateFile)) { return New-DefaultState }
     try {
         return Get-Content -Path $Script:StateFile -Raw -Encoding UTF8 | ConvertFrom-Json
     } catch {
         Write-Log "Cannot read state.json, starting over: $($_.Exception.Message)" 'WARN'
-        return [pscustomobject]@{
-            Step      = 'INIT'
-            StartedAt = (Get-Date).ToString('o')
-            NpiPath   = $null
-            SteamPath = $null
-        }
+        return New-DefaultState
     }
 }
 
@@ -153,229 +174,522 @@ function Clear-State {
 }
 
 # ============================================================================
-#                         UI (WPF / MessageBox)
+#                       UI ASSEMBLIES + MAIN WINDOW
 # ============================================================================
 
-function Initialize-UI {
+function Initialize-UIAssemblies {
     Add-Type -AssemblyName PresentationFramework -ErrorAction SilentlyContinue
     Add-Type -AssemblyName PresentationCore -ErrorAction SilentlyContinue
     Add-Type -AssemblyName WindowsBase -ErrorAction SilentlyContinue
     Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
 }
 
-function Show-InfoBox {
-    param([Parameter(Mandatory)][string]$Message, [string]$Title = 'NvShaderCleaner')
-    Initialize-UI
-    [System.Windows.MessageBox]::Show($Message, $Title, 'OK', 'Information') | Out-Null
+function New-Brush { param([string]$Hex) [System.Windows.Media.BrushConverter]::new().ConvertFrom($Hex) }
+function New-Thickness { param([int]$T=0,[int]$R=0,[int]$B=0,[int]$L=0)
+    if ($PSBoundParameters.Count -eq 1) { return [System.Windows.Thickness]::new($T) }
+    return [System.Windows.Thickness]::new($L,$T,$R,$B)
 }
 
-function Show-ErrorBox {
-    param([Parameter(Mandatory)][string]$Message, [string]$Title = 'NvShaderCleaner')
-    Initialize-UI
-    Write-Log $Message 'ERROR'
-    [System.Windows.MessageBox]::Show($Message, $Title, 'OK', 'Error') | Out-Null
-}
+function Build-MainWindow {
+    $w = New-Object System.Windows.Window
+    $w.Title = "$($Script:AppName) by $($Script:AppAuthor)"
+    $w.Width = 700
+    $w.Height = 500
+    $w.MinWidth = 700
+    $w.MinHeight = 500
+    $w.WindowStartupLocation = 'CenterScreen'
+    $w.ResizeMode = 'NoResize'
+    $w.WindowStyle = 'None'
+    $w.AllowsTransparency = $true
+    $w.Background = New-Brush $Script:Color_Bg
+    $w.FontFamily = New-Object System.Windows.Media.FontFamily 'Segoe UI Variable Display, Segoe UI, Calibri'
 
-function Show-WarnBox {
-    param([Parameter(Mandatory)][string]$Message, [string]$Title = 'NvShaderCleaner')
-    Initialize-UI
-    [System.Windows.MessageBox]::Show($Message, $Title, 'OK', 'Warning') | Out-Null
-}
+    # Outer rounded border
+    $outer = New-Object System.Windows.Controls.Border
+    $outer.BorderBrush     = New-Brush $Script:Color_NvGreen
+    $outer.BorderThickness = New-Thickness 2
+    $outer.CornerRadius    = [System.Windows.CornerRadius]::new(10)
+    $outer.Background      = New-Brush $Script:Color_Bg
 
-function Show-YesNoBox {
-    param([Parameter(Mandatory)][string]$Message, [string]$Title = 'NvShaderCleaner')
-    Initialize-UI
-    $res = [System.Windows.MessageBox]::Show($Message, $Title, 'YesNo', 'Question')
-    return ($res -eq [System.Windows.MessageBoxResult]::Yes)
-}
+    $root = New-Object System.Windows.Controls.Grid
+    $root.Margin = New-Thickness -T 0
+    $rdHeader   = New-Object System.Windows.Controls.RowDefinition; $rdHeader.Height   = 'Auto'
+    $rdSteps    = New-Object System.Windows.Controls.RowDefinition; $rdSteps.Height    = 'Auto'
+    $rdProgress = New-Object System.Windows.Controls.RowDefinition; $rdProgress.Height = 'Auto'
+    $rdStatus   = New-Object System.Windows.Controls.RowDefinition; $rdStatus.Height   = 'Auto'
+    $rdLog      = New-Object System.Windows.Controls.RowDefinition; $rdLog.Height      = '*'
+    $rdAction   = New-Object System.Windows.Controls.RowDefinition; $rdAction.Height   = 'Auto'
+    $rdFooter   = New-Object System.Windows.Controls.RowDefinition; $rdFooter.Height   = 'Auto'
+    $root.RowDefinitions.Add($rdHeader)   | Out-Null
+    $root.RowDefinitions.Add($rdSteps)    | Out-Null
+    $root.RowDefinitions.Add($rdProgress) | Out-Null
+    $root.RowDefinitions.Add($rdStatus)   | Out-Null
+    $root.RowDefinitions.Add($rdLog)      | Out-Null
+    $root.RowDefinitions.Add($rdAction)   | Out-Null
+    $root.RowDefinitions.Add($rdFooter)   | Out-Null
 
-function Show-RebootCountdown {
-    param([int]$Seconds = 5, [string]$Reason = '')
-    Initialize-UI
+    # ---------- HEADER ----------
+    $headerGrid = New-Object System.Windows.Controls.Grid
+    $headerGrid.Margin = New-Thickness -T 18 -R 22 -B 4 -L 22
+    $hc0 = New-Object System.Windows.Controls.ColumnDefinition; $hc0.Width = '*'
+    $hc1 = New-Object System.Windows.Controls.ColumnDefinition; $hc1.Width = 'Auto'
+    $headerGrid.ColumnDefinitions.Add($hc0) | Out-Null
+    $headerGrid.ColumnDefinitions.Add($hc1) | Out-Null
 
-    # Build WPF window entirely in code to avoid FindName issues in ps2exe
-    $window = New-Object System.Windows.Window
-    $window.Title = 'NvShaderCleaner'
-    $window.Height = 220
-    $window.Width = 460
-    $window.WindowStartupLocation = 'CenterScreen'
-    $window.ResizeMode = 'NoResize'
-    $window.WindowStyle = 'None'
-    $window.AllowsTransparency = $true
-    $window.Opacity = 0.98
-    $window.Background = [System.Windows.Media.BrushConverter]::new().ConvertFrom('#1E1E2E')
-
-    $border = New-Object System.Windows.Controls.Border
-    $border.BorderBrush = [System.Windows.Media.BrushConverter]::new().ConvertFrom('#76B900')
-    $border.BorderThickness = [System.Windows.Thickness]::new(2)
-    $border.CornerRadius = [System.Windows.CornerRadius]::new(8)
-
-    $grid = New-Object System.Windows.Controls.Grid
-    $grid.Margin = [System.Windows.Thickness]::new(20)
-    $rd0 = New-Object System.Windows.Controls.RowDefinition; $rd0.Height = 'Auto'
-    $rd1 = New-Object System.Windows.Controls.RowDefinition; $rd1.Height = 'Auto'
-    $rd2 = New-Object System.Windows.Controls.RowDefinition; $rd2.Height = '*'
-    $rd3 = New-Object System.Windows.Controls.RowDefinition; $rd3.Height = 'Auto'
-    $grid.RowDefinitions.Add($rd0)
-    $grid.RowDefinitions.Add($rd1)
-    $grid.RowDefinitions.Add($rd2)
-    $grid.RowDefinitions.Add($rd3)
+    $titleStack = New-Object System.Windows.Controls.StackPanel
+    $titleStack.Orientation = 'Vertical'
 
     $titleTb = New-Object System.Windows.Controls.TextBlock
-    $titleTb.Text = [char]::ConvertFromUtf32(0x26A0) + " Перезагрузка компьютера"
-    $titleTb.FontSize = 20
+    $titleTb.Text       = $Script:AppName
+    $titleTb.FontSize   = 26
     $titleTb.FontWeight = 'Bold'
-    $titleTb.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFrom('#76B900')
-    $titleTb.HorizontalAlignment = 'Center'
-    [System.Windows.Controls.Grid]::SetRow($titleTb, 0)
-    $grid.Children.Add($titleTb) | Out-Null
+    $titleTb.Foreground = New-Brush $Script:Color_NvGreen
+    $titleStack.Children.Add($titleTb) | Out-Null
 
-    $reasonTb = New-Object System.Windows.Controls.TextBlock
-    $reasonTb.Text = $Reason
-    $reasonTb.FontSize = 13
-    $reasonTb.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFrom('#CDD6F4')
-    $reasonTb.TextWrapping = 'Wrap'
-    $reasonTb.HorizontalAlignment = 'Center'
-    $reasonTb.Margin = [System.Windows.Thickness]::new(0,10,0,0)
-    [System.Windows.Controls.Grid]::SetRow($reasonTb, 1)
-    $grid.Children.Add($reasonTb) | Out-Null
+    $subTb = New-Object System.Windows.Controls.TextBlock
+    $subTb.Text       = "NVIDIA shader cache cleaner  ·  by $($Script:AppAuthor)"
+    $subTb.FontSize   = 12
+    $subTb.Foreground = New-Brush $Script:Color_TextDim
+    $subTb.Margin     = New-Thickness -T 2
+    $titleStack.Children.Add($subTb) | Out-Null
 
-    $countTb = New-Object System.Windows.Controls.TextBlock
-    $countTb.Text = "$Seconds сек."
-    $countTb.FontSize = 32
-    $countTb.FontWeight = 'Bold'
-    $countTb.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFrom('#F9E2AF')
-    $countTb.HorizontalAlignment = 'Center'
-    $countTb.VerticalAlignment = 'Center'
-    [System.Windows.Controls.Grid]::SetRow($countTb, 2)
-    $grid.Children.Add($countTb) | Out-Null
+    [System.Windows.Controls.Grid]::SetColumn($titleStack, 0)
+    $headerGrid.Children.Add($titleStack) | Out-Null
 
-    $cancelBtn = New-Object System.Windows.Controls.Button
-    $cancelBtn.Content = 'Отмена (перезагрузить позже вручную)'
-    $cancelBtn.Height = 34
-    $cancelBtn.Background = [System.Windows.Media.BrushConverter]::new().ConvertFrom('#45475A')
-    $cancelBtn.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFrom('#CDD6F4')
-    $cancelBtn.BorderBrush = [System.Windows.Media.BrushConverter]::new().ConvertFrom('#585B70')
-    $cancelBtn.FontSize = 12
-    [System.Windows.Controls.Grid]::SetRow($cancelBtn, 3)
-    $grid.Children.Add($cancelBtn) | Out-Null
+    $closeBtn = New-Object System.Windows.Controls.Button
+    $closeBtn.Content     = '✕'
+    $closeBtn.Width       = 34
+    $closeBtn.Height      = 28
+    $closeBtn.FontSize    = 14
+    $closeBtn.Background  = New-Brush $Script:Color_SurfaceAlt
+    $closeBtn.Foreground  = New-Brush $Script:Color_TextDim
+    $closeBtn.BorderBrush = New-Brush $Script:Color_Border
+    $closeBtn.Cursor      = 'Hand'
+    $closeBtn.VerticalAlignment   = 'Top'
+    $closeBtn.HorizontalAlignment = 'Right'
+    $closeBtn.Add_Click({ $w.Close() })
+    [System.Windows.Controls.Grid]::SetColumn($closeBtn, 1)
+    $headerGrid.Children.Add($closeBtn) | Out-Null
 
-    $border.Child = $grid
-    $window.Content = $border
+    [System.Windows.Controls.Grid]::SetRow($headerGrid, 0)
+    $root.Children.Add($headerGrid) | Out-Null
 
-    $script:_rebootCancelled = $false
-    $script:_secondsLeft     = $Seconds
+    # Drag-to-move
+    $w.Add_MouseLeftButtonDown({ try { $w.DragMove() } catch {} })
 
-    $timer = New-Object System.Windows.Threading.DispatcherTimer
-    $timer.Interval = [TimeSpan]::FromSeconds(1)
-    $timer.Add_Tick({
-        $script:_secondsLeft--
-        if ($script:_secondsLeft -le 0) {
-            $timer.Stop()
-            $window.Close()
-        } else {
-            $countTb.Text = "$($script:_secondsLeft) сек."
-        }
-    })
+    # ---------- STEPS ROW ----------
+    $stepsBorder = New-Object System.Windows.Controls.Border
+    $stepsBorder.Margin          = New-Thickness -T 8 -R 22 -B 6 -L 22
+    $stepsBorder.Background      = New-Brush $Script:Color_Surface
+    $stepsBorder.BorderBrush     = New-Brush $Script:Color_Border
+    $stepsBorder.BorderThickness = New-Thickness 1
+    $stepsBorder.CornerRadius    = [System.Windows.CornerRadius]::new(8)
+    $stepsBorder.Padding         = New-Thickness -T 10 -R 12 -B 10 -L 12
 
-    $cancelBtn.Add_Click({
-        $script:_rebootCancelled = $true
-        $timer.Stop()
-        $window.Close()
-    })
-
-    $timer.Start()
-    $window.ShowDialog() | Out-Null
-    return (-not $script:_rebootCancelled)
-}
-
-function Show-FinalSuccessWindow {
-    Initialize-UI
-
-    $window = New-Object System.Windows.Window
-    $window.Title = 'NvShaderCleaner'
-    $window.Height = 320
-    $window.Width = 520
-    $window.WindowStartupLocation = 'CenterScreen'
-    $window.ResizeMode = 'NoResize'
-    $window.WindowStyle = 'None'
-    $window.AllowsTransparency = $true
-    $window.Opacity = 0.98
-    $window.Background = [System.Windows.Media.BrushConverter]::new().ConvertFrom('#1E1E2E')
-
-    $border = New-Object System.Windows.Controls.Border
-    $border.BorderBrush = [System.Windows.Media.BrushConverter]::new().ConvertFrom('#76B900')
-    $border.BorderThickness = [System.Windows.Thickness]::new(2)
-    $border.CornerRadius = [System.Windows.CornerRadius]::new(10)
-
-    $grid = New-Object System.Windows.Controls.Grid
-    $grid.Margin = [System.Windows.Thickness]::new(24)
-    for ($i = 0; $i -lt 5; $i++) {
-        $rd = New-Object System.Windows.Controls.RowDefinition
-        $rd.Height = if ($i -eq 3) { '*' } else { 'Auto' }
-        $grid.RowDefinitions.Add($rd)
+    $stepsGrid = New-Object System.Windows.Controls.Grid
+    for ($i = 0; $i -lt 3; $i++) {
+        $cd = New-Object System.Windows.Controls.ColumnDefinition
+        $cd.Width = '*'
+        $stepsGrid.ColumnDefinitions.Add($cd) | Out-Null
     }
 
-    $checkTb = New-Object System.Windows.Controls.TextBlock
-    $checkTb.Text = [char]::ConvertFromUtf32(0x2714)
-    $checkTb.FontSize = 64
-    $checkTb.FontWeight = 'Bold'
-    $checkTb.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFrom('#A6E3A1')
-    $checkTb.HorizontalAlignment = 'Center'
-    [System.Windows.Controls.Grid]::SetRow($checkTb, 0)
-    $grid.Children.Add($checkTb) | Out-Null
+    $stepTitles = @(
+        '1. Отключить Shader Cache',
+        '2. Очистить папки кэша',
+        '3. Вернуть Unlimited и завершить'
+    )
+    $stepTexts = @()
+    for ($i = 0; $i -lt 3; $i++) {
+        $sp = New-Object System.Windows.Controls.StackPanel
+        $sp.Orientation = 'Vertical'
 
-    $doneTb = New-Object System.Windows.Controls.TextBlock
-    $doneTb.Text = 'Готово!'
-    $doneTb.FontSize = 26
-    $doneTb.FontWeight = 'Bold'
-    $doneTb.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFrom('#A6E3A1')
-    $doneTb.HorizontalAlignment = 'Center'
-    $doneTb.Margin = [System.Windows.Thickness]::new(0,4,0,0)
-    [System.Windows.Controls.Grid]::SetRow($doneTb, 1)
-    $grid.Children.Add($doneTb) | Out-Null
+        $tb = New-Object System.Windows.Controls.TextBlock
+        $tb.Text       = $stepTitles[$i]
+        $tb.FontSize   = 12
+        $tb.FontWeight = 'SemiBold'
+        $tb.Foreground = New-Brush $Script:Color_TextDim
+        $tb.TextWrapping = 'Wrap'
+        $sp.Children.Add($tb) | Out-Null
 
-    $msgTb = New-Object System.Windows.Controls.TextBlock
-    $msgTb.Text = 'Кэш шейдеров NVIDIA был успешно очищен.'
-    $msgTb.FontSize = 14
-    $msgTb.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFrom('#CDD6F4')
-    $msgTb.HorizontalAlignment = 'Center'
-    $msgTb.Margin = [System.Windows.Thickness]::new(0,12,0,0)
-    $msgTb.TextWrapping = 'Wrap'
-    $msgTb.TextAlignment = 'Center'
-    [System.Windows.Controls.Grid]::SetRow($msgTb, 2)
-    $grid.Children.Add($msgTb) | Out-Null
+        $sub = New-Object System.Windows.Controls.TextBlock
+        $sub.Text       = 'ожидание'
+        $sub.FontSize   = 10
+        $sub.Foreground = New-Brush $Script:Color_TextMuted
+        $sub.Margin     = New-Thickness -T 2
+        $sp.Children.Add($sub) | Out-Null
 
-    $detailsTb = New-Object System.Windows.Controls.TextBlock
-    $detailsTb.Text = "Размер кэша шейдеров возвращён в значение «Без ограничений».`r`nПри следующем запуске игр шейдеры будут перекомпилированы заново."
-    $detailsTb.FontSize = 11
-    $detailsTb.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFrom('#A6ADC8')
-    $detailsTb.HorizontalAlignment = 'Center'
-    $detailsTb.Margin = [System.Windows.Thickness]::new(0,16,0,0)
-    $detailsTb.TextWrapping = 'Wrap'
-    $detailsTb.TextAlignment = 'Center'
-    [System.Windows.Controls.Grid]::SetRow($detailsTb, 3)
-    $grid.Children.Add($detailsTb) | Out-Null
+        [System.Windows.Controls.Grid]::SetColumn($sp, $i)
+        $stepsGrid.Children.Add($sp) | Out-Null
+        $stepTexts += ,@($tb, $sub)
+    }
+    $stepsBorder.Child = $stepsGrid
+    [System.Windows.Controls.Grid]::SetRow($stepsBorder, 1)
+    $root.Children.Add($stepsBorder) | Out-Null
 
-    $okBtn = New-Object System.Windows.Controls.Button
-    $okBtn.Content = 'Закрыть'
-    $okBtn.Height = 38
-    $okBtn.Width = 160
-    $okBtn.HorizontalAlignment = 'Center'
-    $okBtn.Margin = [System.Windows.Thickness]::new(0,16,0,0)
-    $okBtn.Background = [System.Windows.Media.BrushConverter]::new().ConvertFrom('#76B900')
-    $okBtn.Foreground = [System.Windows.Media.Brushes]::White
-    $okBtn.BorderBrush = [System.Windows.Media.BrushConverter]::new().ConvertFrom('#76B900')
-    $okBtn.FontSize = 13
-    $okBtn.FontWeight = 'Bold'
-    [System.Windows.Controls.Grid]::SetRow($okBtn, 4)
-    $grid.Children.Add($okBtn) | Out-Null
+    # ---------- PROGRESS BAR ----------
+    $progressBorder = New-Object System.Windows.Controls.Border
+    $progressBorder.Margin          = New-Thickness -T 4 -R 22 -B 4 -L 22
+    $progressBorder.Background      = New-Brush $Script:Color_Surface
+    $progressBorder.BorderBrush     = New-Brush $Script:Color_Border
+    $progressBorder.BorderThickness = New-Thickness 1
+    $progressBorder.CornerRadius    = [System.Windows.CornerRadius]::new(6)
+    $progressBorder.Height          = 14
 
-    $okBtn.Add_Click({ $window.Close() })
+    $progressInner = New-Object System.Windows.Controls.Border
+    $progressInner.HorizontalAlignment = 'Left'
+    $progressInner.Background          = New-Brush $Script:Color_NvGreen
+    $progressInner.CornerRadius        = [System.Windows.CornerRadius]::new(6)
+    $progressInner.Width               = 0
+    $progressBorder.Child              = $progressInner
 
-    $border.Child = $grid
-    $window.Content = $border
-    $window.ShowDialog() | Out-Null
+    [System.Windows.Controls.Grid]::SetRow($progressBorder, 2)
+    $root.Children.Add($progressBorder) | Out-Null
+
+    # ---------- STATUS LINE ----------
+    $statusTb = New-Object System.Windows.Controls.TextBlock
+    $statusTb.Text       = 'Готов к запуску...'
+    $statusTb.FontSize   = 12
+    $statusTb.Foreground = New-Brush $Script:Color_TextMain
+    $statusTb.Margin     = New-Thickness -T 6 -R 22 -B 6 -L 22
+    [System.Windows.Controls.Grid]::SetRow($statusTb, 3)
+    $root.Children.Add($statusTb) | Out-Null
+
+    # ---------- LOG VIEW ----------
+    $logBorder = New-Object System.Windows.Controls.Border
+    $logBorder.Margin          = New-Thickness -T 0 -R 22 -B 6 -L 22
+    $logBorder.Background      = New-Brush $Script:Color_Surface
+    $logBorder.BorderBrush     = New-Brush $Script:Color_Border
+    $logBorder.BorderThickness = New-Thickness 1
+    $logBorder.CornerRadius    = [System.Windows.CornerRadius]::new(8)
+
+    $logScroll = New-Object System.Windows.Controls.ScrollViewer
+    $logScroll.VerticalScrollBarVisibility   = 'Auto'
+    $logScroll.HorizontalScrollBarVisibility = 'Disabled'
+    $logScroll.Padding = New-Thickness -T 8 -R 10 -B 8 -L 10
+
+    $logPanel = New-Object System.Windows.Controls.StackPanel
+    $logPanel.Orientation = 'Vertical'
+    $logScroll.Content = $logPanel
+    $logBorder.Child   = $logScroll
+
+    [System.Windows.Controls.Grid]::SetRow($logBorder, 4)
+    $root.Children.Add($logBorder) | Out-Null
+
+    # ---------- ACTION PANEL (prompt / reboot countdown / finish) ----------
+    $actionBorder = New-Object System.Windows.Controls.Border
+    $actionBorder.Margin          = New-Thickness -T 0 -R 22 -B 6 -L 22
+    $actionBorder.Background      = New-Brush $Script:Color_SurfaceAlt
+    $actionBorder.BorderBrush     = New-Brush $Script:Color_NvGreen
+    $actionBorder.BorderThickness = New-Thickness 1
+    $actionBorder.CornerRadius    = [System.Windows.CornerRadius]::new(8)
+    $actionBorder.Padding         = New-Thickness -T 10 -R 12 -B 10 -L 12
+    $actionBorder.Visibility      = 'Collapsed'
+
+    $actionGrid = New-Object System.Windows.Controls.Grid
+    $ac0 = New-Object System.Windows.Controls.ColumnDefinition; $ac0.Width = '*'
+    $ac1 = New-Object System.Windows.Controls.ColumnDefinition; $ac1.Width = 'Auto'
+    $actionGrid.ColumnDefinitions.Add($ac0) | Out-Null
+    $actionGrid.ColumnDefinitions.Add($ac1) | Out-Null
+
+    $actionText = New-Object System.Windows.Controls.TextBlock
+    $actionText.FontSize    = 12
+    $actionText.Foreground  = New-Brush $Script:Color_TextMain
+    $actionText.TextWrapping = 'Wrap'
+    $actionText.VerticalAlignment = 'Center'
+    [System.Windows.Controls.Grid]::SetColumn($actionText, 0)
+    $actionGrid.Children.Add($actionText) | Out-Null
+
+    $btnStack = New-Object System.Windows.Controls.StackPanel
+    $btnStack.Orientation = 'Horizontal'
+    $btnStack.VerticalAlignment = 'Center'
+    $btnStack.Margin = New-Thickness -T 0 -R 0 -B 0 -L 12
+    [System.Windows.Controls.Grid]::SetColumn($btnStack, 1)
+    $actionGrid.Children.Add($btnStack) | Out-Null
+
+    $yesBtn = New-Object System.Windows.Controls.Button
+    $yesBtn.Content    = 'Да'
+    $yesBtn.Width      = 100
+    $yesBtn.Height     = 32
+    $yesBtn.FontSize   = 12
+    $yesBtn.FontWeight = 'SemiBold'
+    $yesBtn.Margin     = New-Thickness -T 0 -R 6 -B 0 -L 0
+    $yesBtn.Background = New-Brush $Script:Color_NvGreen
+    $yesBtn.Foreground = [System.Windows.Media.Brushes]::White
+    $yesBtn.BorderBrush= New-Brush $Script:Color_NvGreen
+    $yesBtn.Cursor     = 'Hand'
+    $btnStack.Children.Add($yesBtn) | Out-Null
+
+    $noBtn = New-Object System.Windows.Controls.Button
+    $noBtn.Content    = 'Нет'
+    $noBtn.Width      = 100
+    $noBtn.Height     = 32
+    $noBtn.FontSize   = 12
+    $noBtn.Background = New-Brush $Script:Color_SurfaceAlt
+    $noBtn.Foreground = New-Brush $Script:Color_TextMain
+    $noBtn.BorderBrush= New-Brush $Script:Color_Border
+    $noBtn.Cursor     = 'Hand'
+    $btnStack.Children.Add($noBtn) | Out-Null
+
+    $actionBorder.Child = $actionGrid
+    [System.Windows.Controls.Grid]::SetRow($actionBorder, 5)
+    $root.Children.Add($actionBorder) | Out-Null
+
+    # ---------- FOOTER ----------
+    $footerTb = New-Object System.Windows.Controls.TextBlock
+    $footerTb.Text       = "v$($Script:AppVersion)  ·  © $((Get-Date).Year) $($Script:AppAuthor)  ·  state: $($Script:AppDataDir)"
+    $footerTb.FontSize   = 10
+    $footerTb.Foreground = New-Brush $Script:Color_TextMuted
+    $footerTb.Margin     = New-Thickness -T 4 -R 22 -B 14 -L 22
+    $footerTb.HorizontalAlignment = 'Center'
+    [System.Windows.Controls.Grid]::SetRow($footerTb, 6)
+    $root.Children.Add($footerTb) | Out-Null
+
+    $outer.Child = $root
+    $w.Content   = $outer
+
+    return [pscustomobject]@{
+        Window         = $w
+        StatusText     = $statusTb
+        ProgressOuter  = $progressBorder
+        ProgressInner  = $progressInner
+        LogPanel       = $logPanel
+        LogScroll      = $logScroll
+        StepTexts      = $stepTexts   # array of (title, subtitle)
+        ActionBorder   = $actionBorder
+        ActionText     = $actionText
+        BtnStack       = $btnStack
+        YesBtn         = $yesBtn
+        NoBtn          = $noBtn
+    }
+}
+
+# ============================================================================
+#                          UI UPDATE HELPERS
+# ============================================================================
+
+function Invoke-OnUI {
+    param([Parameter(Mandatory)][scriptblock]$Action)
+    if (-not $Script:UI) { & $Action; return }
+    try {
+        $Script:UI.Window.Dispatcher.Invoke([System.Action]$Action)
+    } catch {
+        try { & $Action } catch {}
+    }
+}
+
+function Add-UILog {
+    param(
+        [Parameter(Mandatory)] [string] $Message,
+        [string] $Level = 'INFO',
+        [string] $Timestamp = $null
+    )
+    if (-not $Script:UI) { return }
+    if (-not $Timestamp) { $Timestamp = (Get-Date).ToString('HH:mm:ss') }
+    else {
+        # use only HH:mm:ss in UI
+        try { $Timestamp = ([datetime]$Timestamp).ToString('HH:mm:ss') } catch {
+            if ($Timestamp.Length -ge 19) { $Timestamp = $Timestamp.Substring(11,8) }
+        }
+    }
+
+    $color = switch ($Level) {
+        'OK'    { $Script:Color_Ok }
+        'WARN'  { $Script:Color_Warn }
+        'ERROR' { $Script:Color_Error }
+        default { $Script:Color_TextMain }
+    }
+    $tag = switch ($Level) {
+        'OK'    { '[OK]   ' }
+        'WARN'  { '[WARN] ' }
+        'ERROR' { '[ERR]  ' }
+        default { '[INFO] ' }
+    }
+
+    Invoke-OnUI {
+        $tb = New-Object System.Windows.Controls.TextBlock
+        $tb.FontFamily = New-Object System.Windows.Media.FontFamily 'Cascadia Mono, Consolas, Segoe UI Mono'
+        $tb.FontSize   = 11
+        $tb.TextWrapping = 'Wrap'
+        $tb.Margin     = New-Thickness -T 1
+        $tb.Foreground = New-Brush $color
+        $tb.Text       = "$Timestamp  $tag$Message"
+        [void]$Script:UI.LogPanel.Children.Add($tb)
+        $Script:UI.LogScroll.ScrollToEnd()
+    }
+}
+
+function Set-UIStatus {
+    param([Parameter(Mandatory)][string]$Text)
+    Invoke-OnUI { $Script:UI.StatusText.Text = $Text }
+}
+
+function Set-UIProgress {
+    param([Parameter(Mandatory)][double]$Percent)
+    if ($Percent -lt 0)   { $Percent = 0 }
+    if ($Percent -gt 100) { $Percent = 100 }
+    Invoke-OnUI {
+        $total = $Script:UI.ProgressOuter.ActualWidth - 2
+        if ($total -lt 1) { $total = $Script:UI.ProgressOuter.Width }
+        $Script:UI.ProgressInner.Width = [Math]::Max(0, $total * ($Percent / 100.0))
+    }
+}
+
+function Set-UIStep {
+    param(
+        [Parameter(Mandatory)][ValidateRange(0,2)][int]$Index,
+        [Parameter(Mandatory)][ValidateSet('pending','active','done','error')] [string]$Status,
+        [string]$Subtitle = $null
+    )
+    Invoke-OnUI {
+        $title = $Script:UI.StepTexts[$Index][0]
+        $sub   = $Script:UI.StepTexts[$Index][1]
+        switch ($Status) {
+            'pending' {
+                $title.Foreground = New-Brush $Script:Color_TextDim
+                if (-not $Subtitle) { $Subtitle = 'ожидание' }
+                $sub.Foreground = New-Brush $Script:Color_TextMuted
+            }
+            'active'  {
+                $title.Foreground = New-Brush $Script:Color_NvGreen
+                if (-not $Subtitle) { $Subtitle = 'выполняется...' }
+                $sub.Foreground = New-Brush $Script:Color_NvGreenSoft
+            }
+            'done'    {
+                $title.Foreground = New-Brush $Script:Color_Ok
+                if (-not $Subtitle) { $Subtitle = 'готово' }
+                $sub.Foreground = New-Brush $Script:Color_Ok
+            }
+            'error'   {
+                $title.Foreground = New-Brush $Script:Color_Error
+                if (-not $Subtitle) { $Subtitle = 'ошибка' }
+                $sub.Foreground = New-Brush $Script:Color_Error
+            }
+        }
+        $sub.Text = $Subtitle
+    }
+}
+
+function Show-PromptInWindow {
+    <#
+        Show a Yes/No prompt inside the main window and BLOCK the
+        worker thread until the user clicks one. Must NOT be called
+        from the UI thread.
+    #>
+    param(
+        [Parameter(Mandatory)] [string] $Message,
+        [string] $YesText = 'Да',
+        [string] $NoText  = 'Нет'
+    )
+    if (-not $Script:UI) { return $true }
+
+    $Script:Prompt.Event  = New-Object System.Threading.ManualResetEventSlim($false)
+    $Script:Prompt.Answer = $null
+
+    Invoke-OnUI {
+        $Script:UI.ActionText.Text   = $Message
+        $Script:UI.ActionText.Foreground = New-Brush $Script:Color_TextMain
+        $Script:UI.YesBtn.Content    = $YesText
+        $Script:UI.NoBtn.Content     = $NoText
+        $Script:UI.YesBtn.Visibility = 'Visible'
+        $Script:UI.NoBtn.Visibility  = 'Visible'
+        $Script:UI.ActionBorder.Visibility = 'Visible'
+    }
+
+    $Script:Prompt.Event.Wait()
+
+    Invoke-OnUI {
+        $Script:UI.ActionBorder.Visibility = 'Collapsed'
+    }
+    return $Script:Prompt.Answer
+}
+
+function Show-RebootCountdownInWindow {
+    <#
+        Embed a 5-second countdown in the action panel.
+        Cancel button cancels the auto-reboot. Returns $true if reboot
+        should happen, $false if user cancelled.
+    #>
+    param(
+        [int]$Seconds = 5,
+        [string]$Reason = ''
+    )
+    if (-not $Script:UI) { return $true }
+
+    $Script:Prompt.Event  = New-Object System.Threading.ManualResetEventSlim($false)
+    $Script:Prompt.Answer = $null
+    $script:_secondsLeft  = $Seconds
+
+    Invoke-OnUI {
+        $Script:UI.ActionText.Foreground = New-Brush $Script:Color_Warn
+        $Script:UI.ActionText.Text       = "⚠  $Reason`nПерезагрузка через $Seconds сек..."
+        $Script:UI.YesBtn.Visibility     = 'Visible'
+        $Script:UI.NoBtn.Visibility      = 'Visible'
+        $Script:UI.YesBtn.Content        = 'Перезагрузить сейчас'
+        $Script:UI.NoBtn.Content         = 'Отмена'
+        $Script:UI.ActionBorder.Visibility = 'Visible'
+
+        $timer = New-Object System.Windows.Threading.DispatcherTimer
+        $timer.Interval = [TimeSpan]::FromSeconds(1)
+        $timer.Add_Tick({
+            $script:_secondsLeft--
+            if ($script:_secondsLeft -le 0) {
+                $timer.Stop()
+                if (-not $Script:Prompt.Event.IsSet) {
+                    $Script:Prompt.Answer = $true
+                    $Script:Prompt.Event.Set()
+                }
+            } else {
+                $Script:UI.ActionText.Text = "⚠  $Reason`nПерезагрузка через $($script:_secondsLeft) сек..."
+            }
+        })
+        $script:_rebootTimer = $timer
+        $timer.Start()
+    }
+
+    $Script:Prompt.Event.Wait()
+
+    Invoke-OnUI {
+        try { if ($script:_rebootTimer) { $script:_rebootTimer.Stop() } } catch {}
+        $Script:UI.ActionBorder.Visibility = 'Collapsed'
+    }
+    return $Script:Prompt.Answer
+}
+
+function Show-FinalSuccessInWindow {
+    if (-not $Script:UI) { return }
+    Invoke-OnUI {
+        $Script:UI.ActionText.Foreground = New-Brush $Script:Color_Ok
+        $Script:UI.ActionText.Text =
+            "✔  Готово! Кэш шейдеров NVIDIA успешно очищен.`n" +
+            "Размер кэша возвращён в значение «Без ограничений».`n" +
+            "При следующем запуске игр шейдеры будут перекомпилированы."
+        $Script:UI.YesBtn.Content    = 'Закрыть'
+        $Script:UI.YesBtn.Visibility = 'Visible'
+        $Script:UI.NoBtn.Visibility  = 'Collapsed'
+        $Script:UI.ActionBorder.Visibility = 'Visible'
+    }
+
+    $Script:Prompt.Event  = New-Object System.Threading.ManualResetEventSlim($false)
+    $Script:Prompt.Answer = $null
+    $Script:Prompt.Event.Wait()
+    Invoke-OnUI { $Script:UI.Window.Close() }
+}
+
+function Show-FatalInWindow {
+    param([Parameter(Mandatory)][string]$Message)
+    if (-not $Script:UI) { return }
+    Invoke-OnUI {
+        $Script:UI.ActionText.Foreground = New-Brush $Script:Color_Error
+        $Script:UI.ActionText.Text       = "✖  $Message`nПодробности в логе: $($Script:LogFile)"
+        $Script:UI.YesBtn.Content        = 'Закрыть'
+        $Script:UI.YesBtn.Visibility     = 'Visible'
+        $Script:UI.NoBtn.Visibility      = 'Collapsed'
+        $Script:UI.ActionBorder.Visibility = 'Visible'
+    }
+    $Script:Prompt.Event  = New-Object System.Threading.ManualResetEventSlim($false)
+    $Script:Prompt.Answer = $null
+    $Script:Prompt.Event.Wait()
+    Invoke-OnUI { $Script:UI.Window.Close() }
 }
 
 # ============================================================================
@@ -383,8 +697,7 @@ function Show-FinalSuccessWindow {
 # ============================================================================
 
 function Ensure-NpiInstalled {
-    $toolsDir = Join-Path (Get-AppDir) 'tools'
-    $npiExe   = Join-Path $toolsDir $Script:NpiExeName
+    $npiExe = Join-Path $Script:ToolsDir $Script:NpiExeName
 
     if (Test-Path $npiExe) {
         Write-Log "NVIDIA Profile Inspector found: $npiExe" 'INFO'
@@ -392,12 +705,13 @@ function Ensure-NpiInstalled {
     }
 
     Write-Log "NVIDIA Profile Inspector not found, downloading..." 'INFO'
+    Set-UIStatus 'Загрузка nvidiaProfileInspector...'
 
-    if (-not (Test-Path $toolsDir)) {
-        New-Item -ItemType Directory -Path $toolsDir -Force | Out-Null
+    if (-not (Test-Path $Script:ToolsDir)) {
+        New-Item -ItemType Directory -Path $Script:ToolsDir -Force | Out-Null
     }
 
-    $zipPath = Join-Path $toolsDir 'nvidiaProfileInspector.zip'
+    $zipPath = Join-Path $Script:ToolsDir 'nvidiaProfileInspector.zip'
 
     $hasInternet = $false
     try {
@@ -409,17 +723,16 @@ function Ensure-NpiInstalled {
     } catch { $hasInternet = $false }
 
     if (-not $hasInternet) {
-        $msg = "Нет подключения к интернету.`r`n`r`n"
-        $msg += "Скачайте вручную:`r`n$($Script:NpiUrl)`r`n`r`n"
-        $msg += "или любую версию с https://github.com/Orbmu2k/nvidiaProfileInspector/releases`r`n`r`n"
-        $msg += "Распакуйте $($Script:NpiExeName) в папку:`r`n$toolsDir`r`n`r`n"
-        $msg += "И запустите программу заново."
-        Show-ErrorBox $msg
-        exit 1
+        $msg = "Нет подключения к интернету. Скачайте $($Script:NpiUrl) вручную и распакуйте $($Script:NpiExeName) в $($Script:ToolsDir)."
+        Write-Log $msg 'ERROR'
+        throw $msg
     }
 
     try {
-        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13 -bor [Net.SecurityProtocolType]::Tls11
+        [Net.ServicePointManager]::SecurityProtocol =
+            [Net.SecurityProtocolType]::Tls12 -bor `
+            [Net.SecurityProtocolType]::Tls13 -bor `
+            [Net.SecurityProtocolType]::Tls11
     } catch {
         try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
     }
@@ -428,31 +741,22 @@ function Ensure-NpiInstalled {
         Write-Log "Downloading $($Script:NpiUrl) ..." 'INFO'
         Invoke-WebRequest -Uri $Script:NpiUrl -OutFile $zipPath -UseBasicParsing -ErrorAction Stop
     } catch {
-        $msg = "Не удалось скачать NVIDIA Profile Inspector.`r`nОшибка: $($_.Exception.Message)`r`n`r`n"
-        $msg += "Скачайте вручную с`r`n$($Script:NpiUrl)`r`n"
-        $msg += "и распакуйте $($Script:NpiExeName) в:`r`n$toolsDir"
-        Show-ErrorBox $msg
-        exit 1
+        throw "Не удалось скачать NVIDIA Profile Inspector: $($_.Exception.Message)"
     }
 
     try {
-        Expand-Archive -Path $zipPath -DestinationPath $toolsDir -Force
+        Expand-Archive -Path $zipPath -DestinationPath $Script:ToolsDir -Force
         Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
     } catch {
-        Show-ErrorBox "Не удалось распаковать NVIDIA Profile Inspector: $($_.Exception.Message)"
-        exit 1
+        throw "Не удалось распаковать NVIDIA Profile Inspector: $($_.Exception.Message)"
     }
 
     if (-not (Test-Path $npiExe)) {
-        $found = Get-ChildItem -Path $toolsDir -Filter $Script:NpiExeName -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($found) {
-            Move-Item -Path $found.FullName -Destination $npiExe -Force
-        }
+        $found = Get-ChildItem -Path $Script:ToolsDir -Filter $Script:NpiExeName -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($found) { Move-Item -Path $found.FullName -Destination $npiExe -Force }
     }
-
     if (-not (Test-Path $npiExe)) {
-        Show-ErrorBox "После распаковки не найден $($Script:NpiExeName) в $toolsDir."
-        exit 1
+        throw "После распаковки не найден $($Script:NpiExeName) в $($Script:ToolsDir)."
     }
 
     Write-Log "NVIDIA Profile Inspector installed: $npiExe" 'OK'
@@ -460,9 +764,6 @@ function Ensure-NpiInstalled {
 }
 
 function New-NipFile {
-    <#
-        Creates a .nip profile file (UTF-16 XML) that NPI can import via -silentImport.
-    #>
     param(
         [Parameter(Mandatory)] [string] $FilePath,
         [Parameter(Mandatory)] [string] $SettingId,
@@ -486,7 +787,6 @@ function New-NipFile {
   </Profile>
 </ArrayOfProfile>
 "@
-    # .nip files must be UTF-16 (Unicode) for NPI to parse them
     $xml | Set-Content -Path $FilePath -Encoding Unicode -Force
     Write-Log "Created .nip file: $FilePath (value=$SettingValue)" 'INFO'
 }
@@ -498,9 +798,9 @@ function Set-ShaderCacheSize {
     )
     $value = if ($Mode -eq 'Disabled') { $Script:ShaderCacheSize_Disabled } else { $Script:ShaderCacheSize_Unlimited }
     Write-Log "Setting Shader Cache Size = $Mode (value=$value) via NPI -silentImport" 'INFO'
+    Set-UIStatus "Применение настройки Shader Cache = $Mode..."
 
     $nipFile = Join-Path $Script:AppDataDir "shader_cache_$($Mode.ToLower()).nip"
-
     try {
         New-NipFile -FilePath $nipFile `
                     -SettingId $Script:ShaderCacheSizeSettingId `
@@ -514,17 +814,9 @@ function Set-ShaderCacheSize {
         $exited = $proc.WaitForExit(60000)
         if (-not $exited) {
             try { $proc.Kill() } catch { }
-            throw "nvidiaProfileInspector не завершился за 60 секунд (завис)."
+            throw 'nvidiaProfileInspector не завершился за 60 секунд (завис).'
         }
-
         Write-Log "Shader Cache Size = $Mode applied successfully." 'OK'
-    } catch {
-        $msg = "Не удалось изменить «Размер кэша шейдеров» через NVIDIA Profile Inspector.`r`n`r`n"
-        $msg += "Ошибка: $($_.Exception.Message)`r`n`r`n"
-        $msg += "Проверьте, что NPI присутствует в:`r`n$NpiPath`r`n"
-        $msg += "и что установлены актуальные драйверы NVIDIA."
-        Show-ErrorBox $msg
-        throw
     } finally {
         Remove-Item $nipFile -Force -ErrorAction SilentlyContinue
     }
@@ -545,6 +837,8 @@ function Get-RunningNvidiaProcesses {
         $_.ProcessName -match '^(?i)(nv|nvidia)' -and ($list.Id -notcontains $_.Id)
     }
     if ($extra) { $list += $extra }
+    # Never include this process itself - .exe is called NvShaderCleaner,
+    # which would otherwise match the ^(nv|nvidia) regex and self-terminate.
     $list = @($list | Where-Object { $_.Id -ne $selfPid })
     return $list
 }
@@ -552,19 +846,16 @@ function Get-RunningNvidiaProcesses {
 function Stop-NvidiaProcessesWithConsent {
     $procs = Get-RunningNvidiaProcesses
     if (-not $procs -or $procs.Count -eq 0) {
-        Write-Log "No running NVIDIA processes found." 'INFO'
+        Write-Log 'No running NVIDIA processes found.' 'INFO'
         return $true
     }
 
     $uniqueNames = ($procs | Select-Object -ExpandProperty ProcessName -Unique)
-    $namesList = ""
-    foreach ($n in $uniqueNames) { $namesList += "`r`n  - $n" }
+    $namesList = ($uniqueNames -join ', ')
+    $msg = "Обнаружены процессы NVIDIA: $namesList. Закрыть их сейчас?"
 
-    $msg = "Обнаружены запущенные процессы NVIDIA:$namesList`r`n`r`n"
-    $msg += "Для продолжения очистки их необходимо закрыть.`r`nЗакрыть эти процессы сейчас?"
-
-    if (-not (Show-YesNoBox -Message $msg -Title 'NvShaderCleaner')) {
-        Write-Log "User refused to close NVIDIA processes." 'WARN'
+    if (-not (Show-PromptInWindow -Message $msg -YesText 'Закрыть процессы' -NoText 'Отмена')) {
+        Write-Log 'User refused to close NVIDIA processes.' 'WARN'
         return $false
     }
 
@@ -654,7 +945,7 @@ function Remove-SteamShaderCache730 {
     $errors  = @()
 
     if (-not $libs -or $libs.Count -eq 0) {
-        Write-Log "Steam not found in registry." 'WARN'
+        Write-Log 'Steam not found in registry.' 'WARN'
         return @{ Cleared = $cleared; Missing = $missing; Errors = $errors; SteamFound = $false }
     }
 
@@ -676,7 +967,6 @@ function Remove-SteamShaderCache730 {
             $errors += "$path : $($_.Exception.Message)"
         }
     }
-
     return @{ Cleared = $cleared; Missing = $missing; Errors = $errors; SteamFound = $true }
 }
 
@@ -686,10 +976,7 @@ function Remove-SteamShaderCache730 {
 
 function Register-ResumeTask {
     $exe = Get-SelfExePath
-    if (-not $exe) {
-        Show-ErrorBox 'Не удалось определить путь к .exe для создания задачи.'
-        throw 'self exe not found'
-    }
+    if (-not $exe) { throw 'Не удалось определить путь к .exe для создания задачи.' }
 
     Unregister-ResumeTask
 
@@ -698,7 +985,7 @@ function Register-ResumeTask {
 
     $action    = New-ScheduledTaskAction -Execute $exe -Argument '-Elevated'
     $trigger   = New-ScheduledTaskTrigger -AtLogOn -User $user
-    $trigger.Delay = 'PT1M'
+    $trigger.Delay = 'PT30S'  # 30-second delay after sign-in
     $principal = New-ScheduledTaskPrincipal -UserId $user -RunLevel Highest -LogonType Interactive
     $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
 
@@ -729,15 +1016,16 @@ function Unregister-ResumeTask {
 function Invoke-RebootOrAbort {
     param([string]$Reason = 'Для применения изменений требуется перезагрузка.')
 
-    $doReboot = Show-RebootCountdown -Seconds 5 -Reason $Reason
+    $doReboot = Show-RebootCountdownInWindow -Seconds 5 -Reason $Reason
     if ($doReboot) {
-        Write-Log "Initiating reboot (shutdown /r /t 5)." 'INFO'
+        Write-Log 'Initiating reboot (shutdown /r /t 5).' 'INFO'
         & shutdown.exe /r /t 5 /c "NvShaderCleaner: reboot to apply shader cache settings."
     } else {
-        Write-Log "User cancelled automatic reboot." 'WARN'
-        Show-InfoBox "Автоматическая перезагрузка отменена.`r`n`r`nПерезагрузите компьютер вручную.`r`nПрограмма автоматически продолжит работу после следующего входа в систему." 'NvShaderCleaner'
+        Write-Log 'User cancelled automatic reboot.' 'WARN'
+        Set-UIStatus 'Автоматическая перезагрузка отменена - перезагрузите ПК вручную.'
+        [System.Threading.Thread]::Sleep(800)
     }
-    exit 0
+    Invoke-OnUI { $Script:UI.Window.Close() }
 }
 
 # ============================================================================
@@ -746,91 +1034,120 @@ function Invoke-RebootOrAbort {
 
 function Invoke-Step-Init {
     Write-Log '=== STEP 1: setting Shader Cache Size = Disabled ===' 'INFO'
+    Set-UIStep -Index 0 -Status active -Subtitle 'отключаем кэш...'
+    Set-UIStep -Index 1 -Status pending
+    Set-UIStep -Index 2 -Status pending
+    Set-UIProgress 5
 
     $npi = Ensure-NpiInstalled
-    try {
-        Set-ShaderCacheSize -Mode Disabled -NpiPath $npi
-    } catch {
-        exit 1
-    }
+    Set-UIProgress 25
 
-    try {
-        Register-ResumeTask
-    } catch {
-        Show-ErrorBox "Не удалось зарегистрировать задачу возобновления: $($_.Exception.Message)"
-        exit 1
-    }
+    Set-UIStatus 'Отключение Shader Cache через NVIDIA Profile Inspector...'
+    Set-ShaderCacheSize -Mode Disabled -NpiPath $npi
+    Set-UIProgress 45
+
+    Set-UIStatus 'Регистрируем автозапуск после перезагрузки...'
+    Register-ResumeTask
+    Set-UIProgress 55
 
     $state = Get-State
     $state.Step    = 'AFTER_REBOOT_1'
     $state.NpiPath = $npi
     Save-State $state
 
-    Invoke-RebootOrAbort -Reason 'Кэш шейдеров отключён. Компьютер перезагрузится, после входа очистка продолжится автоматически.'
+    Set-UIStep -Index 0 -Status done -Subtitle 'кэш отключён'
+    Set-UIProgress 60
+    Invoke-RebootOrAbort -Reason 'Кэш шейдеров отключён. Нужна перезагрузка - очистка продолжится автоматически.'
 }
 
 function Invoke-Step-AfterReboot1 {
     Write-Log '=== STEP 2: cleaning shader cache folders ===' 'INFO'
+    Set-UIStep -Index 0 -Status done -Subtitle 'кэш отключён'
+    Set-UIStep -Index 1 -Status active -Subtitle 'останавливаем процессы NVIDIA...'
+    Set-UIStep -Index 2 -Status pending
+    Set-UIProgress 60
 
     if (-not (Stop-NvidiaProcessesWithConsent)) {
-        $msg = "Очистка не может быть продолжена, пока запущены процессы NVIDIA.`r`n`r`n"
-        $msg += "Закройте их вручную через Диспетчер задач и запустите программу заново."
-        Show-WarnBox $msg 'NvShaderCleaner'
-        exit 0
+        Set-UIStep -Index 1 -Status error -Subtitle 'остановлено пользователем'
+        Show-FatalInWindow 'Очистка не может быть продолжена, пока запущены процессы NVIDIA. Закройте их вручную и запустите программу снова.'
+        return
     }
+    Set-UIProgress 70
 
+    Set-UIStatus 'Удаление папок NVIDIA\DXCache и NVIDIA\GLCache...'
     $nvResult    = Remove-NvidiaCacheFolders
+    Set-UIProgress 78
+
+    Set-UIStatus 'Очистка Steam shadercache\730 (CS2)...'
     $steamResult = Remove-SteamShaderCache730
+    Set-UIProgress 85
 
     $npi = (Get-State).NpiPath
-    if (-not $npi -or -not (Test-Path $npi)) {
-        $npi = Ensure-NpiInstalled
-    }
-    try {
-        Set-ShaderCacheSize -Mode Unlimited -NpiPath $npi
-    } catch {
-        exit 1
-    }
+    if (-not $npi -or -not (Test-Path $npi)) { $npi = Ensure-NpiInstalled }
 
-    $warnings = @()
-    if (-not $steamResult.SteamFound) {
-        $warnings += 'Steam не обнаружен - папка shadercache\730 пропущена.'
-    } elseif ($steamResult.Cleared.Count -eq 0 -and $steamResult.Missing.Count -gt 0) {
-        $warnings += "Папка shadercache\730 не найдена ни в одной библиотеке Steam - пропущена."
-    }
-    if ($nvResult.Errors.Count -gt 0) {
-        $warnings += "Ошибки при удалении папок NVIDIA:`r`n  " + ($nvResult.Errors -join "`r`n  ")
-    }
-    if ($steamResult.Errors.Count -gt 0) {
-        $warnings += "Ошибки при очистке Steam:`r`n  " + ($steamResult.Errors -join "`r`n  ")
-    }
-    if ($warnings.Count -gt 0) {
-        Show-WarnBox (($warnings -join "`r`n`r`n")) 'NvShaderCleaner'
-    }
+    Set-UIStatus 'Возвращаем Shader Cache в Unlimited...'
+    Set-ShaderCacheSize -Mode Unlimited -NpiPath $npi
+    Set-UIProgress 92
+
+    foreach ($e in $nvResult.Errors)    { Write-Log "NVIDIA cache: $e" 'WARN' }
+    foreach ($e in $steamResult.Errors) { Write-Log "Steam cache:  $e" 'WARN' }
 
     $state = Get-State
     $state.Step = 'AFTER_REBOOT_2'
     Save-State $state
 
-    try {
-        Register-ResumeTask
-    } catch {
-        Show-ErrorBox "Не удалось зарегистрировать задачу финального запуска: $($_.Exception.Message)"
-        exit 1
-    }
+    Register-ResumeTask
 
-    Invoke-RebootOrAbort -Reason 'Очистка завершена. Компьютер перезагрузится ещё раз, после чего будет показано итоговое окно.'
+    Set-UIStep -Index 1 -Status done -Subtitle 'кэш очищен'
+    Set-UIProgress 95
+    Invoke-RebootOrAbort -Reason 'Очистка завершена. Перезагрузка для финализации - после входа появится окно завершения.'
 }
 
 function Invoke-Step-AfterReboot2 {
     Write-Log '=== STEP 3: final window ===' 'INFO'
+    Set-UIStep -Index 0 -Status done
+    Set-UIStep -Index 1 -Status done
+    Set-UIStep -Index 2 -Status active -Subtitle 'финализация...'
+    Set-UIProgress 97
 
     Unregister-ResumeTask
-
-    Show-FinalSuccessWindow
-
     Clear-State
+
+    Set-UIStep -Index 2 -Status done -Subtitle 'готово'
+    Set-UIProgress 100
+    Set-UIStatus 'Готово!'
     Write-Log '=== Done. State cleared. ===' 'OK'
+
+    Show-FinalSuccessInWindow
+}
+
+# ============================================================================
+#                                WORKER
+# ============================================================================
+
+function Start-Workflow {
+    $worker = [System.ComponentModel.BackgroundWorker]::new()
+    $worker.WorkerReportsProgress = $true
+
+    $worker.add_DoWork({
+        try {
+            $state = Get-State
+            Write-Log "Current step: $($state.Step)" 'INFO'
+            switch ($state.Step) {
+                'INIT'           { Invoke-Step-Init }
+                'AFTER_REBOOT_1' { Invoke-Step-AfterReboot1 }
+                'AFTER_REBOOT_2' { Invoke-Step-AfterReboot2 }
+                'DONE'           { Clear-State; Invoke-Step-Init }
+                default          { Clear-State; Invoke-Step-Init }
+            }
+        } catch {
+            Write-Log "FATAL: $($_.Exception.Message)`n$($_.ScriptStackTrace)" 'ERROR'
+            Show-FatalInWindow "Непредвиденная ошибка: $($_.Exception.Message)"
+        }
+    })
+
+    $Script:Worker = $worker
+    $worker.RunWorkerAsync()
 }
 
 # ============================================================================
@@ -839,6 +1156,7 @@ function Invoke-Step-AfterReboot2 {
 
 function Main {
     Initialize-AppFolder
+    Initialize-UIAssemblies
 
     Write-Log '----- NvShaderCleaner started -----' 'INFO'
 
@@ -848,23 +1166,55 @@ function Main {
         return
     }
 
-    $state = Get-State
-    Write-Log "Current step: $($state.Step)" 'INFO'
+    $Script:UI = Build-MainWindow
 
-    try {
-        switch ($state.Step) {
-            'INIT'           { Invoke-Step-Init }
-            'AFTER_REBOOT_1' { Invoke-Step-AfterReboot1 }
-            'AFTER_REBOOT_2' { Invoke-Step-AfterReboot2 }
-            'DONE'           { Clear-State; Invoke-Step-Init }
-            default          { Clear-State; Invoke-Step-Init }
+    # Handle Yes/No clicks (shared between prompts, countdown, final & fatal)
+    $Script:UI.YesBtn.Add_Click({
+        if ($Script:Prompt -and $Script:Prompt.Event -and -not $Script:Prompt.Event.IsSet) {
+            $Script:Prompt.Answer = $true
+            $Script:Prompt.Event.Set()
         }
-    } catch {
-        $msg = "Непредвиденная ошибка на шаге $($state.Step):`r`n`r`n$($_.Exception.Message)`r`n`r`nПодробности в логе:`r`n$($Script:LogFile)"
-        Show-ErrorBox $msg
-        Write-Log "FATAL: $($_.Exception.Message)`r`n$($_.ScriptStackTrace)" 'ERROR'
-        exit 1
-    }
+    })
+    $Script:UI.NoBtn.Add_Click({
+        if ($Script:Prompt -and $Script:Prompt.Event -and -not $Script:Prompt.Event.IsSet) {
+            $Script:Prompt.Answer = $false
+            $Script:Prompt.Event.Set()
+        }
+    })
+
+    $Script:UI.Window.Add_Loaded({
+        Set-UIStatus 'Инициализация...'
+        $stateNow = Get-State
+        switch ($stateNow.Step) {
+            'INIT'           {
+                Set-UIStep -Index 0 -Status pending
+                Set-UIStep -Index 1 -Status pending
+                Set-UIStep -Index 2 -Status pending
+            }
+            'AFTER_REBOOT_1' {
+                Set-UIStep -Index 0 -Status done
+                Set-UIStep -Index 1 -Status pending
+                Set-UIStep -Index 2 -Status pending
+                Set-UIProgress 60
+            }
+            'AFTER_REBOOT_2' {
+                Set-UIStep -Index 0 -Status done
+                Set-UIStep -Index 1 -Status done
+                Set-UIStep -Index 2 -Status pending
+                Set-UIProgress 95
+            }
+        }
+        Start-Workflow
+    })
+
+    $Script:UI.Window.Add_Closed({
+        if ($Script:Prompt -and $Script:Prompt.Event -and -not $Script:Prompt.Event.IsSet) {
+            $Script:Prompt.Answer = $false
+            $Script:Prompt.Event.Set()
+        }
+    })
+
+    [void]$Script:UI.Window.ShowDialog()
 }
 
 Main
