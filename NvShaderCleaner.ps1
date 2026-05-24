@@ -1,23 +1,6 @@
 ﻿<#
 .SYNOPSIS
-    NvShaderCleaner — корректная очистка кэша шейдеров NVIDIA на Windows 10/11.
-
-.DESCRIPTION
-    Программа выполняет полный цикл очистки шейдер-кэша:
-      1) Через NVIDIA Profile Inspector выставляет "Shader Cache Size" = Disabled
-      2) Перезагружает ПК (авто, через 5 сек, с возможностью отмены)
-      3) После перезагрузки автоматически продолжается (Task Scheduler):
-         - Закрывает фоновые процессы NVIDIA (с подтверждением пользователя)
-         - Удаляет %LOCALAPPDATA%\NVIDIA\DXCache и GLCache
-         - Удаляет содержимое <Steam>\steamapps\shadercache\730
-      4) Возвращает "Shader Cache Size" = Unlimited
-      5) Перезагружает ПК ещё раз
-      6) Выводит красивое окно с сообщением об успехе
-
-    Состояние хранится в %LOCALAPPDATA%\NvShaderCleaner\state.json,
-    лог пишется в %LOCALAPPDATA%\NvShaderCleaner\log.txt.
-
-    Скрипт рассчитан на сборку в .exe через ps2exe (см. Build-Exe.ps1).
+    NvShaderCleaner - clean NVIDIA shader cache on Windows 10/11.
 #>
 
 [CmdletBinding()]
@@ -26,7 +9,7 @@ param(
 )
 
 # ============================================================================
-#                                КОНСТАНТЫ
+#                                CONSTANTS
 # ============================================================================
 
 $Script:AppName       = 'NvShaderCleaner'
@@ -35,27 +18,18 @@ $Script:StateFile     = Join-Path $Script:AppDataDir 'state.json'
 $Script:LogFile       = Join-Path $Script:AppDataDir 'log.txt'
 $Script:TaskName      = 'NvShaderCleaner_Resume'
 
-# Стабильная версия NVIDIA Profile Inspector (релизы Orbmu2k/nvidiaProfileInspector)
 $Script:NpiVersion    = '2.4.0.4'
-$Script:NpiUrl        = "https://github.com/Orbmu2k/nvidiaProfileInspector/releases/download/$Script:NpiVersion/nvidiaProfileInspector.zip"
+$Script:NpiUrl        = "https://github.com/Orbmu2k/nvidiaProfileInspector/releases/download/$($Script:NpiVersion)/nvidiaProfileInspector.zip"
 $Script:NpiExeName    = 'nvidiaProfileInspector.exe'
 
-# Setting ID для "Shader Cache Size" в NVIDIA Profile Inspector
-# Значения:
-#   0x00000000 — Disabled
-#   0xFFFFFFFF — Unlimited
-$Script:ShaderCacheSettingId = '0x00E1C92E'
-$Script:ShaderCache_Disabled  = '0x00000000'
-$Script:ShaderCache_Unlimited = '0xFFFFFFFF'
+# NVAPI Setting IDs (decimal) for .nip files
+# PS_SHADERDISKCACHE_MAX_SIZE_ID = 0x00AC8497 = 11306135
+# Values: 0 = Disabled, 4294967295 (0xFFFFFFFF) = Unlimited
+$Script:ShaderCacheSizeSettingId    = '11306135'
+$Script:ShaderCacheSizeSettingName  = 'Shader disk cache maximum size'
+$Script:ShaderCacheSize_Disabled    = '0'
+$Script:ShaderCacheSize_Unlimited   = '4294967295'
 
-# Шаги state machine
-$Script:STEP_INIT             = 'INIT'
-$Script:STEP_AFTER_REBOOT_1   = 'AFTER_REBOOT_1'
-$Script:STEP_AFTER_REBOOT_2   = 'AFTER_REBOOT_2'
-$Script:STEP_DONE             = 'DONE'
-
-# Процессы NVIDIA, которые могут блокировать удаление DXCache/GLCache
-# (по согласованию с пользователем — закрываем ВСЕ, включая Control Panel UI)
 $Script:NvidiaProcessNames = @(
     'nvcontainer',
     'NVDisplay.Container',
@@ -78,7 +52,7 @@ $Script:NvidiaProcessNames = @(
 )
 
 # ============================================================================
-#                            ОБЩИЕ ВСПОМОГАТЕЛЬНЫЕ
+#                               HELPERS
 # ============================================================================
 
 function Initialize-AppFolder {
@@ -97,12 +71,10 @@ function Write-Log {
     try {
         Add-Content -Path $Script:LogFile -Value $line -Encoding UTF8
     } catch { }
-    # Дублируем в консоль, если она есть (полезно при отладке)
     try { Write-Host $line } catch { }
 }
 
 function Get-AppDir {
-    # Каталог, где лежит запущенный .exe (или .ps1)
     try {
         $exePath = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
         if ($exePath -and ($exePath -notmatch 'powershell|pwsh|conhost')) {
@@ -129,16 +101,15 @@ function Test-Administrator {
 }
 
 function Invoke-SelfElevate {
-    # Перезапускает текущий .exe с правами администратора
     $exe = Get-SelfExePath
     if (-not $exe) {
-        Show-ErrorBox 'Не удалось определить путь к собственному исполняемому файлу для повышения прав.'
+        Show-ErrorBox 'Не удалось определить путь к .exe для повышения прав.'
         exit 1
     }
     try {
         Start-Process -FilePath $exe -Verb RunAs -ArgumentList '-Elevated' | Out-Null
     } catch {
-        Show-ErrorBox "Запуск с правами администратора отменён или не удался: $($_.Exception.Message)"
+        Show-ErrorBox "Запуск с правами администратора отменён: $($_.Exception.Message)"
         exit 1
     }
     exit 0
@@ -151,7 +122,7 @@ function Invoke-SelfElevate {
 function Get-State {
     if (-not (Test-Path $Script:StateFile)) {
         return [pscustomobject]@{
-            Step      = $Script:STEP_INIT
+            Step      = 'INIT'
             StartedAt = (Get-Date).ToString('o')
             NpiPath   = $null
             SteamPath = $null
@@ -160,9 +131,9 @@ function Get-State {
     try {
         return Get-Content -Path $Script:StateFile -Raw -Encoding UTF8 | ConvertFrom-Json
     } catch {
-        Write-Log "Не удалось прочитать state.json, начинаю заново: $($_.Exception.Message)" 'WARN'
+        Write-Log "Cannot read state.json, starting over: $($_.Exception.Message)" 'WARN'
         return [pscustomobject]@{
-            Step      = $Script:STEP_INIT
+            Step      = 'INIT'
             StartedAt = (Get-Date).ToString('o')
             NpiPath   = $null
             SteamPath = $null
@@ -182,11 +153,14 @@ function Clear-State {
 }
 
 # ============================================================================
-#                         WPF / WINFORMS UI (русский)
+#                         UI (WPF / MessageBox)
 # ============================================================================
 
 function Initialize-UI {
-    Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Windows.Forms, System.Drawing | Out-Null
+    Add-Type -AssemblyName PresentationFramework -ErrorAction SilentlyContinue
+    Add-Type -AssemblyName PresentationCore -ErrorAction SilentlyContinue
+    Add-Type -AssemblyName WindowsBase -ErrorAction SilentlyContinue
+    Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
 }
 
 function Show-InfoBox {
@@ -196,7 +170,7 @@ function Show-InfoBox {
 }
 
 function Show-ErrorBox {
-    param([Parameter(Mandatory)][string]$Message, [string]$Title = 'NvShaderCleaner — ошибка')
+    param([Parameter(Mandatory)][string]$Message, [string]$Title = 'NvShaderCleaner')
     Initialize-UI
     Write-Log $Message 'ERROR'
     [System.Windows.MessageBox]::Show($Message, $Title, 'OK', 'Error') | Out-Null
@@ -216,52 +190,81 @@ function Show-YesNoBox {
 }
 
 function Show-RebootCountdown {
-    <#
-        Красивое модальное окно WPF: "Перезагрузка через N сек, [Отмена]".
-        Возвращает $true — пользователь подтвердил/таймер истёк, перезагружать.
-                  $false — пользователь нажал Отмена.
-    #>
-    param([int]$Seconds = 5, [string]$Reason = 'Для применения изменений требуется перезагрузка')
+    param([int]$Seconds = 5, [string]$Reason = '')
     Initialize-UI
 
-    [xml]$xaml = @"
-<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
-        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="NvShaderCleaner — Перезагрузка"
-        Height="220" Width="460"
-        WindowStartupLocation="CenterScreen"
-        ResizeMode="NoResize"
-        WindowStyle="None"
-        Background="#1E1E2E"
-        AllowsTransparency="True"
-        Opacity="0.98">
-    <Border BorderBrush="#76B900" BorderThickness="2" CornerRadius="8">
-        <Grid Margin="20">
-            <Grid.RowDefinitions>
-                <RowDefinition Height="Auto"/>
-                <RowDefinition Height="Auto"/>
-                <RowDefinition Height="*"/>
-                <RowDefinition Height="Auto"/>
-            </Grid.RowDefinitions>
-            <TextBlock Grid.Row="0" Text="Перезагрузка компьютера" FontSize="20" FontWeight="Bold" Foreground="#76B900" HorizontalAlignment="Center"/>
-            <TextBlock Grid.Row="1" x:Name="ReasonText" Text="" FontSize="13" Foreground="#CDD6F4" TextWrapping="Wrap" HorizontalAlignment="Center" Margin="0,10,0,0"/>
-            <TextBlock Grid.Row="2" x:Name="CountdownText" Text="" FontSize="32" FontWeight="Bold" Foreground="#F9E2AF" HorizontalAlignment="Center" VerticalAlignment="Center"/>
-            <Button Grid.Row="3" x:Name="CancelBtn" Content="Отмена (перезагрузить позже вручную)" Height="34" Background="#45475A" Foreground="#CDD6F4" BorderBrush="#585B70" FontSize="12"/>
-        </Grid>
-    </Border>
-</Window>
-"@
+    # Build WPF window entirely in code to avoid FindName issues in ps2exe
+    $window = New-Object System.Windows.Window
+    $window.Title = 'NvShaderCleaner'
+    $window.Height = 220
+    $window.Width = 460
+    $window.WindowStartupLocation = 'CenterScreen'
+    $window.ResizeMode = 'NoResize'
+    $window.WindowStyle = 'None'
+    $window.AllowsTransparency = $true
+    $window.Opacity = 0.98
+    $window.Background = [System.Windows.Media.BrushConverter]::new().ConvertFrom('#1E1E2E')
 
-    $reader  = New-Object System.Xml.XmlNodeReader $xaml
-    $window  = [Windows.Markup.XamlReader]::Load($reader)
-    $reason  = $window.FindName('ReasonText')
-    $count   = $window.FindName('CountdownText')
-    $btn     = $window.FindName('CancelBtn')
-    $reason.Text = $Reason
+    $border = New-Object System.Windows.Controls.Border
+    $border.BorderBrush = [System.Windows.Media.BrushConverter]::new().ConvertFrom('#76B900')
+    $border.BorderThickness = [System.Windows.Thickness]::new(2)
+    $border.CornerRadius = [System.Windows.CornerRadius]::new(8)
+
+    $grid = New-Object System.Windows.Controls.Grid
+    $grid.Margin = [System.Windows.Thickness]::new(20)
+    $rd0 = New-Object System.Windows.Controls.RowDefinition; $rd0.Height = 'Auto'
+    $rd1 = New-Object System.Windows.Controls.RowDefinition; $rd1.Height = 'Auto'
+    $rd2 = New-Object System.Windows.Controls.RowDefinition; $rd2.Height = '*'
+    $rd3 = New-Object System.Windows.Controls.RowDefinition; $rd3.Height = 'Auto'
+    $grid.RowDefinitions.Add($rd0)
+    $grid.RowDefinitions.Add($rd1)
+    $grid.RowDefinitions.Add($rd2)
+    $grid.RowDefinitions.Add($rd3)
+
+    $titleTb = New-Object System.Windows.Controls.TextBlock
+    $titleTb.Text = [char]::ConvertFromUtf32(0x26A0) + " Перезагрузка компьютера"
+    $titleTb.FontSize = 20
+    $titleTb.FontWeight = 'Bold'
+    $titleTb.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFrom('#76B900')
+    $titleTb.HorizontalAlignment = 'Center'
+    [System.Windows.Controls.Grid]::SetRow($titleTb, 0)
+    $grid.Children.Add($titleTb) | Out-Null
+
+    $reasonTb = New-Object System.Windows.Controls.TextBlock
+    $reasonTb.Text = $Reason
+    $reasonTb.FontSize = 13
+    $reasonTb.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFrom('#CDD6F4')
+    $reasonTb.TextWrapping = 'Wrap'
+    $reasonTb.HorizontalAlignment = 'Center'
+    $reasonTb.Margin = [System.Windows.Thickness]::new(0,10,0,0)
+    [System.Windows.Controls.Grid]::SetRow($reasonTb, 1)
+    $grid.Children.Add($reasonTb) | Out-Null
+
+    $countTb = New-Object System.Windows.Controls.TextBlock
+    $countTb.Text = "$Seconds сек."
+    $countTb.FontSize = 32
+    $countTb.FontWeight = 'Bold'
+    $countTb.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFrom('#F9E2AF')
+    $countTb.HorizontalAlignment = 'Center'
+    $countTb.VerticalAlignment = 'Center'
+    [System.Windows.Controls.Grid]::SetRow($countTb, 2)
+    $grid.Children.Add($countTb) | Out-Null
+
+    $cancelBtn = New-Object System.Windows.Controls.Button
+    $cancelBtn.Content = 'Отмена (перезагрузить позже вручную)'
+    $cancelBtn.Height = 34
+    $cancelBtn.Background = [System.Windows.Media.BrushConverter]::new().ConvertFrom('#45475A')
+    $cancelBtn.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFrom('#CDD6F4')
+    $cancelBtn.BorderBrush = [System.Windows.Media.BrushConverter]::new().ConvertFrom('#585B70')
+    $cancelBtn.FontSize = 12
+    [System.Windows.Controls.Grid]::SetRow($cancelBtn, 3)
+    $grid.Children.Add($cancelBtn) | Out-Null
+
+    $border.Child = $grid
+    $window.Content = $border
 
     $script:_rebootCancelled = $false
     $script:_secondsLeft     = $Seconds
-    $count.Text = "$Seconds сек."
 
     $timer = New-Object System.Windows.Threading.DispatcherTimer
     $timer.Interval = [TimeSpan]::FromSeconds(1)
@@ -271,11 +274,11 @@ function Show-RebootCountdown {
             $timer.Stop()
             $window.Close()
         } else {
-            $count.Text = "$script:_secondsLeft сек."
+            $countTb.Text = "$($script:_secondsLeft) сек."
         }
     })
 
-    $btn.Add_Click({
+    $cancelBtn.Add_Click({
         $script:_rebootCancelled = $true
         $timer.Stop()
         $window.Close()
@@ -287,57 +290,91 @@ function Show-RebootCountdown {
 }
 
 function Show-FinalSuccessWindow {
-    <#
-        Красивое финальное окно: "Кэш шейдеров успешно очищен".
-    #>
     Initialize-UI
 
-    [xml]$xaml = @"
-<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
-        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="NvShaderCleaner — Готово"
-        Height="320" Width="520"
-        WindowStartupLocation="CenterScreen"
-        ResizeMode="NoResize"
-        WindowStyle="None"
-        Background="#1E1E2E"
-        AllowsTransparency="True"
-        Opacity="0.98">
-    <Border BorderBrush="#76B900" BorderThickness="2" CornerRadius="10">
-        <Grid Margin="24">
-            <Grid.RowDefinitions>
-                <RowDefinition Height="Auto"/>
-                <RowDefinition Height="Auto"/>
-                <RowDefinition Height="Auto"/>
-                <RowDefinition Height="*"/>
-                <RowDefinition Height="Auto"/>
-            </Grid.RowDefinitions>
+    $window = New-Object System.Windows.Window
+    $window.Title = 'NvShaderCleaner'
+    $window.Height = 320
+    $window.Width = 520
+    $window.WindowStartupLocation = 'CenterScreen'
+    $window.ResizeMode = 'NoResize'
+    $window.WindowStyle = 'None'
+    $window.AllowsTransparency = $true
+    $window.Opacity = 0.98
+    $window.Background = [System.Windows.Media.BrushConverter]::new().ConvertFrom('#1E1E2E')
 
-            <TextBlock Grid.Row="0" Text="✓" FontSize="64" FontWeight="Bold" Foreground="#A6E3A1" HorizontalAlignment="Center"/>
+    $border = New-Object System.Windows.Controls.Border
+    $border.BorderBrush = [System.Windows.Media.BrushConverter]::new().ConvertFrom('#76B900')
+    $border.BorderThickness = [System.Windows.Thickness]::new(2)
+    $border.CornerRadius = [System.Windows.CornerRadius]::new(10)
 
-            <TextBlock Grid.Row="1" Text="Готово!" FontSize="26" FontWeight="Bold" Foreground="#A6E3A1" HorizontalAlignment="Center" Margin="0,4,0,0"/>
+    $grid = New-Object System.Windows.Controls.Grid
+    $grid.Margin = [System.Windows.Thickness]::new(24)
+    for ($i = 0; $i -lt 5; $i++) {
+        $rd = New-Object System.Windows.Controls.RowDefinition
+        $rd.Height = if ($i -eq 3) { '*' } else { 'Auto' }
+        $grid.RowDefinitions.Add($rd)
+    }
 
-            <TextBlock Grid.Row="2" Text="Кэш шейдеров NVIDIA был успешно очищен."
-                       FontSize="14" Foreground="#CDD6F4" HorizontalAlignment="Center" Margin="0,12,0,0" TextWrapping="Wrap" TextAlignment="Center"/>
+    $checkTb = New-Object System.Windows.Controls.TextBlock
+    $checkTb.Text = [char]::ConvertFromUtf32(0x2714)
+    $checkTb.FontSize = 64
+    $checkTb.FontWeight = 'Bold'
+    $checkTb.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFrom('#A6E3A1')
+    $checkTb.HorizontalAlignment = 'Center'
+    [System.Windows.Controls.Grid]::SetRow($checkTb, 0)
+    $grid.Children.Add($checkTb) | Out-Null
 
-            <TextBlock Grid.Row="3" x:Name="DetailsText"
-                       FontSize="11" Foreground="#A6ADC8" HorizontalAlignment="Center"
-                       Margin="0,16,0,0" TextWrapping="Wrap" TextAlignment="Center"/>
+    $doneTb = New-Object System.Windows.Controls.TextBlock
+    $doneTb.Text = 'Готово!'
+    $doneTb.FontSize = 26
+    $doneTb.FontWeight = 'Bold'
+    $doneTb.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFrom('#A6E3A1')
+    $doneTb.HorizontalAlignment = 'Center'
+    $doneTb.Margin = [System.Windows.Thickness]::new(0,4,0,0)
+    [System.Windows.Controls.Grid]::SetRow($doneTb, 1)
+    $grid.Children.Add($doneTb) | Out-Null
 
-            <Button Grid.Row="4" x:Name="OkBtn" Content="Закрыть" Height="38" Width="160"
-                    HorizontalAlignment="Center" Margin="0,16,0,0"
-                    Background="#76B900" Foreground="White" BorderBrush="#76B900" FontSize="13" FontWeight="Bold"/>
-        </Grid>
-    </Border>
-</Window>
-"@
+    $msgTb = New-Object System.Windows.Controls.TextBlock
+    $msgTb.Text = 'Кэш шейдеров NVIDIA был успешно очищен.'
+    $msgTb.FontSize = 14
+    $msgTb.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFrom('#CDD6F4')
+    $msgTb.HorizontalAlignment = 'Center'
+    $msgTb.Margin = [System.Windows.Thickness]::new(0,12,0,0)
+    $msgTb.TextWrapping = 'Wrap'
+    $msgTb.TextAlignment = 'Center'
+    [System.Windows.Controls.Grid]::SetRow($msgTb, 2)
+    $grid.Children.Add($msgTb) | Out-Null
 
-    $reader = New-Object System.Xml.XmlNodeReader $xaml
-    $window = [Windows.Markup.XamlReader]::Load($reader)
-    $details = $window.FindName('DetailsText')
-    $okBtn   = $window.FindName('OkBtn')
-    $details.Text = "Размер кэша шейдеров возвращён в значение «Без ограничений».`r`nПри следующем запуске игр шейдеры будут перекомпилированы заново."
+    $detailsTb = New-Object System.Windows.Controls.TextBlock
+    $detailsTb.Text = "Размер кэша шейдеров возвращён в значение «Без ограничений».`r`nПри следующем запуске игр шейдеры будут перекомпилированы заново."
+    $detailsTb.FontSize = 11
+    $detailsTb.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFrom('#A6ADC8')
+    $detailsTb.HorizontalAlignment = 'Center'
+    $detailsTb.Margin = [System.Windows.Thickness]::new(0,16,0,0)
+    $detailsTb.TextWrapping = 'Wrap'
+    $detailsTb.TextAlignment = 'Center'
+    [System.Windows.Controls.Grid]::SetRow($detailsTb, 3)
+    $grid.Children.Add($detailsTb) | Out-Null
+
+    $okBtn = New-Object System.Windows.Controls.Button
+    $okBtn.Content = 'Закрыть'
+    $okBtn.Height = 38
+    $okBtn.Width = 160
+    $okBtn.HorizontalAlignment = 'Center'
+    $okBtn.Margin = [System.Windows.Thickness]::new(0,16,0,0)
+    $okBtn.Background = [System.Windows.Media.BrushConverter]::new().ConvertFrom('#76B900')
+    $okBtn.Foreground = [System.Windows.Media.Brushes]::White
+    $okBtn.BorderBrush = [System.Windows.Media.BrushConverter]::new().ConvertFrom('#76B900')
+    $okBtn.FontSize = 13
+    $okBtn.FontWeight = 'Bold'
+    [System.Windows.Controls.Grid]::SetRow($okBtn, 4)
+    $grid.Children.Add($okBtn) | Out-Null
+
     $okBtn.Add_Click({ $window.Close() })
+
+    $border.Child = $grid
+    $window.Content = $border
     $window.ShowDialog() | Out-Null
 }
 
@@ -345,26 +382,16 @@ function Show-FinalSuccessWindow {
 #                        NVIDIA PROFILE INSPECTOR
 # ============================================================================
 
-function Get-NpiPath {
-    $toolsDir = Join-Path (Get-AppDir) 'tools'
-    return (Join-Path $toolsDir $Script:NpiExeName)
-}
-
 function Ensure-NpiInstalled {
-    <#
-        Проверяет наличие nvidiaProfileInspector.exe в .\tools\.
-        Если нет — пытается скачать с GitHub. Если интернета нет —
-        просит пользователя положить файл вручную и завершает работу.
-    #>
     $toolsDir = Join-Path (Get-AppDir) 'tools'
     $npiExe   = Join-Path $toolsDir $Script:NpiExeName
 
     if (Test-Path $npiExe) {
-        Write-Log "NVIDIA Profile Inspector уже установлен: $npiExe" 'INFO'
+        Write-Log "NVIDIA Profile Inspector found: $npiExe" 'INFO'
         return $npiExe
     }
 
-    Write-Log "NVIDIA Profile Inspector не найден, пытаюсь скачать с GitHub..." 'INFO'
+    Write-Log "NVIDIA Profile Inspector not found, downloading..." 'INFO'
 
     if (-not (Test-Path $toolsDir)) {
         New-Item -ItemType Directory -Path $toolsDir -Force | Out-Null
@@ -372,7 +399,6 @@ function Ensure-NpiInstalled {
 
     $zipPath = Join-Path $toolsDir 'nvidiaProfileInspector.zip'
 
-    # Проверка интернета
     $hasInternet = $false
     try {
         $tcp = New-Object System.Net.Sockets.TcpClient
@@ -383,19 +409,12 @@ function Ensure-NpiInstalled {
     } catch { $hasInternet = $false }
 
     if (-not $hasInternet) {
-        Show-ErrorBox @"
-Не удалось подключиться к интернету для загрузки NVIDIA Profile Inspector.
-
-Пожалуйста, скачайте архив вручную:
-$($Script:NpiUrl)
-
-или любую версию с https://github.com/Orbmu2k/nvidiaProfileInspector/releases
-
-Распакуйте $($Script:NpiExeName) в папку:
-$toolsDir
-
-И запустите программу заново.
-"@
+        $msg = "Нет подключения к интернету.`r`n`r`n"
+        $msg += "Скачайте вручную:`r`n$($Script:NpiUrl)`r`n`r`n"
+        $msg += "или любую версию с https://github.com/Orbmu2k/nvidiaProfileInspector/releases`r`n`r`n"
+        $msg += "Распакуйте $($Script:NpiExeName) в папку:`r`n$toolsDir`r`n`r`n"
+        $msg += "И запустите программу заново."
+        Show-ErrorBox $msg
         exit 1
     }
 
@@ -406,18 +425,13 @@ $toolsDir
     }
 
     try {
-        Write-Log "Скачиваю $($Script:NpiUrl) ..." 'INFO'
+        Write-Log "Downloading $($Script:NpiUrl) ..." 'INFO'
         Invoke-WebRequest -Uri $Script:NpiUrl -OutFile $zipPath -UseBasicParsing -ErrorAction Stop
     } catch {
-        Show-ErrorBox @"
-Не удалось скачать NVIDIA Profile Inspector с GitHub.
-Ошибка: $($_.Exception.Message)
-
-Скачайте архив вручную с
-$($Script:NpiUrl)
-и распакуйте $($Script:NpiExeName) в:
-$toolsDir
-"@
+        $msg = "Не удалось скачать NVIDIA Profile Inspector.`r`nОшибка: $($_.Exception.Message)`r`n`r`n"
+        $msg += "Скачайте вручную с`r`n$($Script:NpiUrl)`r`n"
+        $msg += "и распакуйте $($Script:NpiExeName) в:`r`n$toolsDir"
+        Show-ErrorBox $msg
         exit 1
     }
 
@@ -425,12 +439,11 @@ $toolsDir
         Expand-Archive -Path $zipPath -DestinationPath $toolsDir -Force
         Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
     } catch {
-        Show-ErrorBox "Не удалось распаковать архив NVIDIA Profile Inspector: $($_.Exception.Message)"
+        Show-ErrorBox "Не удалось распаковать NVIDIA Profile Inspector: $($_.Exception.Message)"
         exit 1
     }
 
     if (-not (Test-Path $npiExe)) {
-        # На случай, если внутри архива другой регистр / папка
         $found = Get-ChildItem -Path $toolsDir -Filter $Script:NpiExeName -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
         if ($found) {
             Move-Item -Path $found.FullName -Destination $npiExe -Force
@@ -438,12 +451,44 @@ $toolsDir
     }
 
     if (-not (Test-Path $npiExe)) {
-        Show-ErrorBox "После распаковки не удалось найти $($Script:NpiExeName) в $toolsDir."
+        Show-ErrorBox "После распаковки не найден $($Script:NpiExeName) в $toolsDir."
         exit 1
     }
 
-    Write-Log "NVIDIA Profile Inspector установлен: $npiExe" 'OK'
+    Write-Log "NVIDIA Profile Inspector installed: $npiExe" 'OK'
     return $npiExe
+}
+
+function New-NipFile {
+    <#
+        Creates a .nip profile file (UTF-16 XML) that NPI can import via -silentImport.
+    #>
+    param(
+        [Parameter(Mandatory)] [string] $FilePath,
+        [Parameter(Mandatory)] [string] $SettingId,
+        [Parameter(Mandatory)] [string] $SettingName,
+        [Parameter(Mandatory)] [string] $SettingValue
+    )
+    $xml = @"
+<?xml version="1.0" encoding="utf-16"?>
+<ArrayOfProfile xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <Profile>
+    <ProfileName>Base Profile</ProfileName>
+    <Executeables />
+    <Settings>
+      <ProfileSetting>
+        <SettingNameInfo>$SettingName</SettingNameInfo>
+        <SettingID>$SettingId</SettingID>
+        <SettingValue>$SettingValue</SettingValue>
+        <ValueType>Dword</ValueType>
+      </ProfileSetting>
+    </Settings>
+  </Profile>
+</ArrayOfProfile>
+"@
+    # .nip files must be UTF-16 (Unicode) for NPI to parse them
+    $xml | Set-Content -Path $FilePath -Encoding Unicode -Force
+    Write-Log "Created .nip file: $FilePath (value=$SettingValue)" 'INFO'
 }
 
 function Set-ShaderCacheSize {
@@ -451,33 +496,42 @@ function Set-ShaderCacheSize {
         [Parameter(Mandatory)] [ValidateSet('Disabled','Unlimited')] [string] $Mode,
         [Parameter(Mandatory)] [string] $NpiPath
     )
-    $value = if ($Mode -eq 'Disabled') { $Script:ShaderCache_Disabled } else { $Script:ShaderCache_Unlimited }
-    Write-Log "Применяю Shader Cache Size = $Mode ($value) через $NpiPath" 'INFO'
+    $value = if ($Mode -eq 'Disabled') { $Script:ShaderCacheSize_Disabled } else { $Script:ShaderCacheSize_Unlimited }
+    Write-Log "Setting Shader Cache Size = $Mode (value=$value) via NPI -silentImport" 'INFO'
+
+    $nipFile = Join-Path $Script:AppDataDir "shader_cache_$($Mode.ToLower()).nip"
 
     try {
+        New-NipFile -FilePath $nipFile `
+                    -SettingId $Script:ShaderCacheSizeSettingId `
+                    -SettingName $Script:ShaderCacheSizeSettingName `
+                    -SettingValue $value
+
         $proc = Start-Process -FilePath $NpiPath `
-            -ArgumentList @('-setProfileSetting', '"Base Profile"', $Script:ShaderCacheSettingId, $value) `
-            -PassThru -Wait -WindowStyle Hidden -ErrorAction Stop
-        if ($proc.ExitCode -ne 0) {
-            throw "nvidiaProfileInspector вернул код $($proc.ExitCode)"
+            -ArgumentList "`"$nipFile`"", '-silentImport' `
+            -PassThru -WindowStyle Hidden -ErrorAction Stop
+
+        $exited = $proc.WaitForExit(60000)
+        if (-not $exited) {
+            try { $proc.Kill() } catch { }
+            throw "nvidiaProfileInspector не завершился за 60 секунд (завис)."
         }
-        Write-Log "Shader Cache Size = $Mode применён успешно." 'OK'
+
+        Write-Log "Shader Cache Size = $Mode applied successfully." 'OK'
     } catch {
-        Show-ErrorBox @"
-Не удалось изменить параметр «Размер кэша шейдеров» через NVIDIA Profile Inspector.
-
-Ошибка: $($_.Exception.Message)
-
-Проверьте, что NVIDIA Profile Inspector присутствует в:
-$NpiPath
-и что у вас установлены актуальные драйверы NVIDIA.
-"@
+        $msg = "Не удалось изменить «Размер кэша шейдеров» через NVIDIA Profile Inspector.`r`n`r`n"
+        $msg += "Ошибка: $($_.Exception.Message)`r`n`r`n"
+        $msg += "Проверьте, что NPI присутствует в:`r`n$NpiPath`r`n"
+        $msg += "и что установлены актуальные драйверы NVIDIA."
+        Show-ErrorBox $msg
         throw
+    } finally {
+        Remove-Item $nipFile -Force -ErrorAction SilentlyContinue
     }
 }
 
 # ============================================================================
-#                          ПРОЦЕССЫ NVIDIA
+#                          NVIDIA PROCESSES
 # ============================================================================
 
 function Get-RunningNvidiaProcesses {
@@ -486,7 +540,6 @@ function Get-RunningNvidiaProcesses {
         $p = Get-Process -Name $name -ErrorAction SilentlyContinue
         if ($p) { $list += $p }
     }
-    # Дополнительно — что-нибудь с "nvidia" в имени, чтобы не пропустить новые компоненты
     $extra = Get-Process -ErrorAction SilentlyContinue | Where-Object {
         $_.ProcessName -match '^(?i)(nv|nvidia)' -and ($list.Id -notcontains $_.Id)
     }
@@ -495,37 +548,30 @@ function Get-RunningNvidiaProcesses {
 }
 
 function Stop-NvidiaProcessesWithConsent {
-    <#
-        Если есть запущенные процессы NVIDIA — спрашивает у пользователя
-        подтверждение и закрывает их. Возвращает $true, если всё ок (или
-        процессов не было), $false — если пользователь отказался.
-    #>
     $procs = Get-RunningNvidiaProcesses
     if (-not $procs -or $procs.Count -eq 0) {
-        Write-Log "Запущенных процессов NVIDIA не обнаружено." 'INFO'
+        Write-Log "No running NVIDIA processes found." 'INFO'
         return $true
     }
 
-    $names = ($procs | Select-Object -ExpandProperty ProcessName -Unique) -join "`r`n  • "
-    $msg = @"
-Обнаружены запущенные процессы NVIDIA, которые могут помешать удалению кэша:
+    $uniqueNames = ($procs | Select-Object -ExpandProperty ProcessName -Unique)
+    $namesList = ""
+    foreach ($n in $uniqueNames) { $namesList += "`r`n  - $n" }
 
-  • $names
+    $msg = "Обнаружены запущенные процессы NVIDIA:$namesList`r`n`r`n"
+    $msg += "Для продолжения очистки их необходимо закрыть.`r`nЗакрыть эти процессы сейчас?"
 
-Чтобы продолжить очистку, их необходимо закрыть.
-Закрыть эти процессы сейчас?
-"@
-    if (-not (Show-YesNoBox -Message $msg -Title 'Закрыть процессы NVIDIA?')) {
-        Write-Log "Пользователь отказался закрывать процессы NVIDIA." 'WARN'
+    if (-not (Show-YesNoBox -Message $msg -Title 'NvShaderCleaner')) {
+        Write-Log "User refused to close NVIDIA processes." 'WARN'
         return $false
     }
 
     foreach ($p in $procs) {
         try {
-            Write-Log "Завершаю процесс $($p.ProcessName) (PID $($p.Id))..." 'INFO'
+            Write-Log "Stopping $($p.ProcessName) (PID $($p.Id))..." 'INFO'
             Stop-Process -Id $p.Id -Force -ErrorAction Stop
         } catch {
-            Write-Log "Не удалось завершить $($p.ProcessName): $($_.Exception.Message)" 'WARN'
+            Write-Log "Failed to stop $($p.ProcessName): $($_.Exception.Message)" 'WARN'
         }
     }
     Start-Sleep -Seconds 2
@@ -533,7 +579,7 @@ function Stop-NvidiaProcessesWithConsent {
 }
 
 # ============================================================================
-#                       УДАЛЕНИЕ ПАПОК КЭША
+#                       CACHE FOLDER DELETION
 # ============================================================================
 
 function Remove-NvidiaCacheFolders {
@@ -543,22 +589,22 @@ function Remove-NvidiaCacheFolders {
     $errors  = @()
 
     if (-not (Test-Path $base)) {
-        Write-Log "Папка $base не найдена — нечего удалять." 'INFO'
+        Write-Log "Folder $base not found, nothing to delete." 'INFO'
         return @{ Removed = $removed; Errors = $errors }
     }
 
     foreach ($name in $targets) {
         $path = Join-Path $base $name
         if (-not (Test-Path $path)) {
-            Write-Log "Папка $path отсутствует — пропускаю." 'INFO'
+            Write-Log "Folder $path does not exist, skipping." 'INFO'
             continue
         }
         try {
             Remove-Item -Path $path -Recurse -Force -ErrorAction Stop
-            Write-Log "Удалена $path" 'OK'
+            Write-Log "Deleted $path" 'OK'
             $removed += $path
         } catch {
-            Write-Log "Ошибка при удалении $path : $($_.Exception.Message)" 'ERROR'
+            Write-Log "Error deleting $path : $($_.Exception.Message)" 'ERROR'
             $errors += "$path : $($_.Exception.Message)"
         }
     }
@@ -566,13 +612,6 @@ function Remove-NvidiaCacheFolders {
 }
 
 function Find-SteamPath {
-    <#
-        Ищет путь к установке Steam через реестр.
-        Возможные ключи:
-          HKCU:\Software\Valve\Steam  -> SteamPath
-          HKLM:\SOFTWARE\WOW6432Node\Valve\Steam -> InstallPath
-          HKLM:\SOFTWARE\Valve\Steam -> InstallPath
-    #>
     $candidates = @(
         @{ Path='HKCU:\Software\Valve\Steam';                   Name='SteamPath'   },
         @{ Path='HKLM:\SOFTWARE\WOW6432Node\Valve\Steam';       Name='InstallPath' },
@@ -588,10 +627,6 @@ function Find-SteamPath {
 }
 
 function Get-AllSteamLibraries {
-    <#
-        Возвращает все пути библиотек Steam: основная + дополнительные
-        из libraryfolders.vdf.
-    #>
     $main = Find-SteamPath
     if (-not $main) { return @() }
 
@@ -611,24 +646,20 @@ function Get-AllSteamLibraries {
 }
 
 function Remove-SteamShaderCache730 {
-    <#
-        Удаляет содержимое <Library>\steamapps\shadercache\730 во всех
-        обнаруженных библиотеках Steam. Возвращает hashtable с результатами.
-    #>
     $libs = Get-AllSteamLibraries
     $cleared = @()
     $missing = @()
     $errors  = @()
 
     if (-not $libs -or $libs.Count -eq 0) {
-        Write-Log "Steam не обнаружен в реестре." 'WARN'
+        Write-Log "Steam not found in registry." 'WARN'
         return @{ Cleared = $cleared; Missing = $missing; Errors = $errors; SteamFound = $false }
     }
 
     foreach ($lib in $libs) {
         $path = Join-Path $lib 'steamapps\shadercache\730'
         if (-not (Test-Path $path)) {
-            Write-Log "Путь $path не существует — пропускаю." 'INFO'
+            Write-Log "Path $path does not exist, skipping." 'INFO'
             $missing += $path
             continue
         }
@@ -636,10 +667,10 @@ function Remove-SteamShaderCache730 {
             Get-ChildItem -Path $path -Force -ErrorAction Stop | ForEach-Object {
                 Remove-Item -Path $_.FullName -Recurse -Force -ErrorAction Stop
             }
-            Write-Log "Содержимое $path удалено." 'OK'
+            Write-Log "Cleared $path" 'OK'
             $cleared += $path
         } catch {
-            Write-Log "Ошибка при очистке $path : $($_.Exception.Message)" 'ERROR'
+            Write-Log "Error clearing $path : $($_.Exception.Message)" 'ERROR'
             $errors += "$path : $($_.Exception.Message)"
         }
     }
@@ -652,22 +683,16 @@ function Remove-SteamShaderCache730 {
 # ============================================================================
 
 function Register-ResumeTask {
-    <#
-        Создаёт одноразовую запланированную задачу AtLogon, которая через
-        1 минуту после входа пользователя в систему запустит наш .exe снова
-        с правами администратора. Задача удаляется самим скриптом в конце.
-    #>
     $exe = Get-SelfExePath
     if (-not $exe) {
-        Show-ErrorBox 'Не удалось определить путь к .exe для создания задачи возобновления.'
+        Show-ErrorBox 'Не удалось определить путь к .exe для создания задачи.'
         throw 'self exe not found'
     }
 
-    # Сначала удаляем, если уже существует
     Unregister-ResumeTask
 
     $user = "$env:USERDOMAIN\$env:USERNAME"
-    Write-Log "Регистрирую запланированную задачу '$Script:TaskName' для пользователя $user → $exe" 'INFO'
+    Write-Log "Registering scheduled task '$($Script:TaskName)' for $user -> $exe" 'INFO'
 
     $action    = New-ScheduledTaskAction -Execute $exe -Argument '-Elevated'
     $trigger   = New-ScheduledTaskTrigger -AtLogOn -User $user
@@ -688,92 +713,73 @@ function Unregister-ResumeTask {
         $t = Get-ScheduledTask -TaskName $Script:TaskName -ErrorAction SilentlyContinue
         if ($t) {
             Unregister-ScheduledTask -TaskName $Script:TaskName -Confirm:$false -ErrorAction SilentlyContinue
-            Write-Log "Запланированная задача '$Script:TaskName' удалена." 'INFO'
+            Write-Log "Scheduled task '$($Script:TaskName)' removed." 'INFO'
         }
     } catch {
-        Write-Log "Не удалось удалить задачу '$Script:TaskName': $($_.Exception.Message)" 'WARN'
+        Write-Log "Failed to remove task '$($Script:TaskName)': $($_.Exception.Message)" 'WARN'
     }
 }
 
 # ============================================================================
-#                              ПЕРЕЗАГРУЗКА
+#                              REBOOT
 # ============================================================================
 
 function Invoke-RebootOrAbort {
-    <#
-        Показывает окно обратного отсчёта, затем (если не отменено) выполняет
-        shutdown /r /t 5. При отмене — выводит инструкцию и завершает работу,
-        ожидая ручной перезагрузки (запланированная задача всё равно запустит
-        скрипт после входа пользователя).
-    #>
-    param([string]$Reason = 'Для применения изменений требуется перезагрузка ПК.')
+    param([string]$Reason = 'Для применения изменений требуется перезагрузка.')
 
     $doReboot = Show-RebootCountdown -Seconds 5 -Reason $Reason
     if ($doReboot) {
-        Write-Log "Запускаю перезагрузку (shutdown /r /t 5)." 'INFO'
-        & shutdown.exe /r /t 5 /c "NvShaderCleaner: перезагрузка для применения настроек кэша шейдеров."
+        Write-Log "Initiating reboot (shutdown /r /t 5)." 'INFO'
+        & shutdown.exe /r /t 5 /c "NvShaderCleaner: reboot to apply shader cache settings."
     } else {
-        Write-Log "Пользователь отменил автоматическую перезагрузку." 'WARN'
-        Show-InfoBox @"
-Автоматическая перезагрузка отменена.
-
-Пожалуйста, перезагрузите компьютер вручную, когда будете готовы.
-Программа автоматически продолжит работу после следующего входа в систему.
-"@ 'Перезагрузка отложена'
+        Write-Log "User cancelled automatic reboot." 'WARN'
+        Show-InfoBox "Автоматическая перезагрузка отменена.`r`n`r`nПерезагрузите компьютер вручную.`r`nПрограмма автоматически продолжит работу после следующего входа в систему." 'NvShaderCleaner'
     }
     exit 0
 }
 
 # ============================================================================
-#                                ШАГИ
+#                                STEPS
 # ============================================================================
 
 function Invoke-Step-Init {
-    Write-Log '=== ШАГ 1: настройка Shader Cache Size = Disabled ===' 'INFO'
+    Write-Log '=== STEP 1: setting Shader Cache Size = Disabled ===' 'INFO'
 
     $npi = Ensure-NpiInstalled
     try {
         Set-ShaderCacheSize -Mode Disabled -NpiPath $npi
     } catch {
-        # Ошибка уже показана. Не сохраняем состояние, чтобы при перезапуске начали заново.
         exit 1
     }
 
-    # Создаём задачу на возобновление и сохраняем состояние
     try {
         Register-ResumeTask
     } catch {
-        Show-ErrorBox "Не удалось зарегистрировать задачу возобновления после перезагрузки: $($_.Exception.Message)"
+        Show-ErrorBox "Не удалось зарегистрировать задачу возобновления: $($_.Exception.Message)"
         exit 1
     }
 
     $state = Get-State
-    $state.Step    = $Script:STEP_AFTER_REBOOT_1
+    $state.Step    = 'AFTER_REBOOT_1'
     $state.NpiPath = $npi
     Save-State $state
 
-    Invoke-RebootOrAbort -Reason 'Кэш шейдеров отключён. Сейчас компьютер перезагрузится, а после входа очистка продолжится автоматически.'
+    Invoke-RebootOrAbort -Reason 'Кэш шейдеров отключён. Компьютер перезагрузится, после входа очистка продолжится автоматически.'
 }
 
 function Invoke-Step-AfterReboot1 {
-    Write-Log '=== ШАГ 2: очистка папок кэша шейдеров ===' 'INFO'
+    Write-Log '=== STEP 2: cleaning shader cache folders ===' 'INFO'
 
-    # Закрываем NVIDIA процессы (с подтверждением)
     if (-not (Stop-NvidiaProcessesWithConsent)) {
-        Show-WarnBox @"
-Очистка не может быть продолжена, пока запущены процессы NVIDIA.
-
-Закройте их вручную через Диспетчер задач и запустите программу заново
-(запланированная задача автоматически удалится при повторном запуске).
-"@ 'Очистка прервана'
-        # Оставляем state как есть — пользователь сможет вернуться
+        $msg = "Очистка не может быть продолжена, пока запущены процессы NVIDIA.`r`n`r`n"
+        $msg += "Закройте их вручную через Диспетчер задач и запустите программу заново."
+        Show-WarnBox $msg 'NvShaderCleaner'
         exit 0
     }
 
     $nvResult    = Remove-NvidiaCacheFolders
     $steamResult = Remove-SteamShaderCache730
 
-    # Восстанавливаем Shader Cache Size = Unlimited
     $npi = (Get-State).NpiPath
     if (-not $npi -or -not (Test-Path $npi)) {
         $npi = Ensure-NpiInstalled
@@ -784,12 +790,11 @@ function Invoke-Step-AfterReboot1 {
         exit 1
     }
 
-    # Сводное уведомление, если были ошибки или Steam не найден
     $warnings = @()
     if (-not $steamResult.SteamFound) {
-        $warnings += 'Steam не обнаружен в системе — папка shadercache\730 пропущена.'
+        $warnings += 'Steam не обнаружен - папка shadercache\730 пропущена.'
     } elseif ($steamResult.Cleared.Count -eq 0 -and $steamResult.Missing.Count -gt 0) {
-        $warnings += "Папка shadercache\730 не найдена ни в одной библиотеке Steam — пропущена.`r`nПроверены: $($steamResult.Missing -join '; ')"
+        $warnings += "Папка shadercache\730 не найдена ни в одной библиотеке Steam - пропущена."
     }
     if ($nvResult.Errors.Count -gt 0) {
         $warnings += "Ошибки при удалении папок NVIDIA:`r`n  " + ($nvResult.Errors -join "`r`n  ")
@@ -798,12 +803,11 @@ function Invoke-Step-AfterReboot1 {
         $warnings += "Ошибки при очистке Steam:`r`n  " + ($steamResult.Errors -join "`r`n  ")
     }
     if ($warnings.Count -gt 0) {
-        Show-WarnBox (($warnings -join "`r`n`r`n")) 'NvShaderCleaner — внимание'
+        Show-WarnBox (($warnings -join "`r`n`r`n")) 'NvShaderCleaner'
     }
 
-    # Готовимся ко второй перезагрузке
     $state = Get-State
-    $state.Step = $Script:STEP_AFTER_REBOOT_2
+    $state.Step = 'AFTER_REBOOT_2'
     Save-State $state
 
     try {
@@ -813,18 +817,18 @@ function Invoke-Step-AfterReboot1 {
         exit 1
     }
 
-    Invoke-RebootOrAbort -Reason 'Очистка завершена. Перезагрузим компьютер ещё раз для применения настроек, после чего покажем итоговое окно.'
+    Invoke-RebootOrAbort -Reason 'Очистка завершена. Компьютер перезагрузится ещё раз, после чего будет показано итоговое окно.'
 }
 
 function Invoke-Step-AfterReboot2 {
-    Write-Log '=== ШАГ 3: финальное окно ===' 'INFO'
+    Write-Log '=== STEP 3: final window ===' 'INFO'
 
     Unregister-ResumeTask
 
     Show-FinalSuccessWindow
 
     Clear-State
-    Write-Log '=== Готово. State очищен. ===' 'OK'
+    Write-Log '=== Done. State cleared. ===' 'OK'
 }
 
 # ============================================================================
@@ -832,20 +836,18 @@ function Invoke-Step-AfterReboot2 {
 # ============================================================================
 
 function Main {
-    # Каталог состояния создаём до всего остального
     Initialize-AppFolder
 
-    Write-Log '----- NvShaderCleaner запущен -----' 'INFO'
+    Write-Log '----- NvShaderCleaner started -----' 'INFO'
 
-    # Если не админ — повышаем права
     if (-not (Test-Administrator)) {
-        Write-Log 'Прав администратора нет, запрашиваю UAC...' 'INFO'
+        Write-Log 'Not admin, requesting UAC...' 'INFO'
         Invoke-SelfElevate
-        return  # Invoke-SelfElevate сама делает exit
+        return
     }
 
     $state = Get-State
-    Write-Log "Текущий шаг: $($state.Step)" 'INFO'
+    Write-Log "Current step: $($state.Step)" 'INFO'
 
     try {
         switch ($state.Step) {
@@ -856,7 +858,8 @@ function Main {
             default          { Clear-State; Invoke-Step-Init }
         }
     } catch {
-        Show-ErrorBox "Произошла непредвиденная ошибка на шаге $($state.Step):`r`n`r`n$($_.Exception.Message)`r`n`r`nПодробности см. в логе:`r`n$Script:LogFile"
+        $msg = "Непредвиденная ошибка на шаге $($state.Step):`r`n`r`n$($_.Exception.Message)`r`n`r`nПодробности в логе:`r`n$($Script:LogFile)"
+        Show-ErrorBox $msg
         Write-Log "FATAL: $($_.Exception.Message)`r`n$($_.ScriptStackTrace)" 'ERROR'
         exit 1
     }

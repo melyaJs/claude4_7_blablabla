@@ -99,15 +99,16 @@
 
 ## Технические детали
 
-- Изменение параметра `Shader Cache Size` выполняется командой:
-  ```
-  nvidiaProfileInspector.exe -setProfileSetting "Base Profile" 0x00E1C92E <value>
-  ```
-  где `value` = `0x00000000` (Disabled) или `0xFFFFFFFF` (Unlimited).
+- Изменение параметра «Shader Cache Size» выполняется через **`.nip` файл** (формат профиля NPI) + **`-silentImport`**:
+  1. Программа генерирует XML-файл `.nip` (UTF-16) с нужным значением настройки.
+  2. Запускает `nvidiaProfileInspector.exe <файл.nip> -silentImport` — без GUI, полностью тихо.
+  3. Удаляет временный `.nip` файл.
+- **Setting ID**: `0x00AC8497` (NVAPI `PS_SHADERDISKCACHE_MAX_SIZE_ID`, decimal `11306135`).
+  Значения: `0` = Disabled, `4294967295` = Unlimited.
 - Steam ищется через реестр (`HKCU\Software\Valve\Steam\SteamPath` и `HKLM\…\Valve\Steam\InstallPath`), а дополнительные библиотеки — из `libraryfolders.vdf`.
 - Возобновление после перезагрузки реализовано через Task Scheduler (`AtLogon` + `Delay PT1M`, `RunLevel Highest`). Задача удаляется самим скриптом после выполнения.
 - Авто-перезагрузка: `shutdown /r /t 5` с предварительным окном обратного отсчёта (5 секунд, кнопка «Отмена»).
-- UI — WPF на встроенном XAML, тема в стиле NVIDIA (зелёный `#76B900` на тёмном фоне).
+- UI — WPF, построенный программно (без XAML), тема в стиле NVIDIA (зелёный `#76B900` на тёмном фоне). Это обходит проблему с `FindName()`, которая не работает в ps2exe.
 
 ---
 
