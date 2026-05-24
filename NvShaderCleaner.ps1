@@ -535,6 +535,7 @@ function Set-ShaderCacheSize {
 # ============================================================================
 
 function Get-RunningNvidiaProcesses {
+    $selfPid = $PID
     $list = @()
     foreach ($name in $Script:NvidiaProcessNames) {
         $p = Get-Process -Name $name -ErrorAction SilentlyContinue
@@ -544,6 +545,7 @@ function Get-RunningNvidiaProcesses {
         $_.ProcessName -match '^(?i)(nv|nvidia)' -and ($list.Id -notcontains $_.Id)
     }
     if ($extra) { $list += $extra }
+    $list = @($list | Where-Object { $_.Id -ne $selfPid })
     return $list
 }
 
