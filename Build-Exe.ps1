@@ -20,7 +20,7 @@ param(
     [string]$Title       = 'NvShaderCleaner',
     [string]$Description = 'NVIDIA Shader Cache Cleaner',
     [string]$Company     = 'NvShaderCleaner',
-    [string]$Version     = '1.0.0.0'
+    [string]$Version     = '1.2.0.0'
 )
 
 $ErrorActionPreference = 'Stop'
